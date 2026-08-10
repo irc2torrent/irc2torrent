@@ -1,0 +1,111 @@
+[package]
+name = "irc2torrent"
+description = "IRC bot that downloads torrents from IRC"
+version = "0.15.0"
+edition = "2021"
+license = "MIT"
+documentation = "none yet"
+homepage = "https://github.com/irc2torrent/irc2torrent"
+repository = "https://github.com/irc2torrent/irc2torrent"
+
+[package.metadata.bundle.irc2torrent]
+name = "irc2torrent"
+version = "0.1.0"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+# NOTE: `cargo-release` used to sit in [dev-dependencies]. It is a binary tool,
+# not a library, and depending on it pulled `git2` and a large tree of build
+# tooling into the lockfile -- including three RUSTSEC advisories against git2.
+# Install it with `cargo install cargo-release` instead.
+
+# NOTE: `async-std` was removed (RUSTSEC-2025-0052, discontinued). It was only
+# used for `task::sleep`, which tokio already provides.
+
+# TLS: rustls everywhere, no OpenSSL.
+#
+# `openssl`/`openssl-sys` used to be listed here purely to force a vendored
+# build; nothing in src/ ever called them. Vendoring compiled all of OpenSSL from
+# source on every clean build (needing perl and several minutes) and still left
+# RUSTSEC-2025-0022 and RUSTSEC-2025-0004 to track. Selecting rustls removes the
+# dependency instead of chasing its advisories.
+#
+# Every TLS consumer must opt in explicitly, otherwise one of them silently drags
+# native-tls -- and therefore OpenSSL -- back into the tree:
+#   * reqwest      -> default features include default-tls (= native-tls)
+#   * irc          -> defaults to "tls-native"
+#   * dxr_client   -> default is "reqwest?/default-tls"
+#
+# Trade-off: rustls validates certificates more strictly than OpenSSL. A tracker
+# IRC server presenting a legacy certificate (CN with no SAN, or an expired
+# intermediate) that native-tls tolerated will now fail to connect.
+[dependencies]
+# The upstream default is [ctcp, tls-native, channel-lists, toml_config, encoding].
+# This is that list with only the TLS backend swapped -- `toml_config` in
+# particular carries the serde derives on irc::client::data::Config, without
+# which reading irc.toml does not compile.
+irc = { version = "1.1", default-features = false, features = [
+    "ctcp", "channel-lists", "toml_config", "encoding", "tls-rust",
+] }
+futures = "0.3.31"
+tokio = { version = "1.47", features = ["full", "test-util"] }  # RUSTSEC-2025-0023
+regex = "1.11"
+# Deliberately still 0.12, not the 0.13.1 Dependabot merged in #22.
+# dxr_client pins reqwest "0.12"; taking 0.13 only here would put two reqwest
+# majors -- and so two complete HTTP+TLS stacks -- back in the tree, which is
+# exactly what produced RUSTSEC-2024-0421 and the three rustls-webpki 0.101
+# advisories. Moving to 0.13 means bumping both crates together and re-testing
+# the rustls feature selection; worth doing, but as its own change.
+reqwest = { version = "0.12.24", default-features = false, features = ["json", "cookies", "rustls-tls", "charset", "http2"] }
+reqwest_cookie_store = "0.9.0"
+base64 = "0.22.1"
+dxr_client = { path = "dxr/dxr_client", default-features = false, features = ["reqwest", "multicall", "rustls-tls"] }
+# dxr's "i8" feature carries the non-standard <i8> XML-RPC type that rTorrent
+# uses for 64-bit values. dxr_client's default enabled it; since defaults are now
+# off, enable it here explicitly or every large value breaks.
+dxr = { path = "dxr/dxr", features = ["i8"] }
+anyhow = "1.0.100"                                            # RUSTSEC-2026-0190
+thiserror = "2.0"
+toml = "0.9.5"
+serde = "1.0.203"
+serde_derive = "1.0.203"
+serde_json = "1.0.117"
+directories = "6.0.0"
+syslog = "7.0.0"
+simplelog = { version = "^0.12.2" , features = ["test"] }
+log = "0.4.21"
+lava_torrent = "0.11.1"
+async-trait = { version = "0.1.77", features = [] }
+pub-sub = "2.0.0"                                             # was "*": any future release, unreviewed
+subtle = "2.6"                                                # constant-time password comparison
+libc = "0.2"                                                  # waitpid/kill for supervisor (PID 1) mode
+# Direct dependency purely so a crypto provider can be installed explicitly at
+# startup. reqwest's rustls-tls pulls aws-lc-rs and the irc crate's tls-rust
+# pulls ring; with both present rustls 0.23 refuses to pick one and panics on
+# the first TLS handshake. See the install_default() call in main.rs.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+# tokio-scgi was listed here but never referenced from src/; the SCGI transport
+# lives in dxr_client, which no longer needs it either.
+chrono = "0.4.38"
+clap = "4.5.2"
+notify = "8.2.0"
+# Already in the tree via lettre; used only to pick alt-nick suffixes.
+fastrand = "2"
+# Already in the tree via url/reqwest. Direct because the download URL is built
+# from a user template with values taken straight off IRC, and keeping those
+# inside their own URL component is a security primitive -- not something to
+# hand-roll. See src/platforms/url_template.rs.
+percent-encoding = "2"
+# Slack Socket Mode is a WebSocket -- the one thing reqwest cannot do. rustls
+# with bundled roots, matching the stance everywhere else: no native-tls, no
+# OpenSSL. Only Slack needs this; Telegram is plain HTTPS.
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+# Email notifications. rustls+ring only: matches the stance above and keeps
+# aws-lc-rs out, which would reintroduce the CryptoProvider ambiguity.
+lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "tokio1-rustls", "ring", "webpki-roots", "builder", "hostname", "tokio1"] }
+
+[dev-dependencies]
+# Already present transitively via reqwest/dxr; needed directly so a test can
+# pin down how the `unix:` socket URL parses, since dxr resolves the socket
+# path with Url::path().
+url = "2.5"

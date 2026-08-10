@@ -1,0 +1,422 @@
+# irc2torrent — annotated options.toml
+#
+# Lives at $HOME/.config/options.toml, which is /config/.config/options.toml in
+# the container. On first run irc2torrent writes a minimal version of this file
+# and exits; this copy is the same thing with every option spelled out.
+#
+# Edits are picked up live — no restart. That includes all of [notifications]:
+# the event switches, the digest and rate settings, and the backends themselves,
+# which are rebuilt in place. Adding [notifications.email] to a running bot works.
+#
+# Four things are consumed once at startup and do need a restart: `platform`,
+# `clients`, `[telegram]` and `[slack]`. Each logs a line saying so rather than
+# pretending it applied. The two transports are on that list because their
+# tables configure the *command* listener as well, and reloading only the
+# notification half would leave the two roles on different credentials.
+#
+# If a saved file fails to parse or contains an invalid regex, the running
+# config is kept and the reason is logged (and notified, if you have
+# notifications on).
+
+# ---------------------------------------------------------------------------
+# What to grab
+# ---------------------------------------------------------------------------
+
+# A release is taken if it matches ANY of these...
+regex_for_downloads_match = [
+    "Some Release.*2160p.*",
+    "Another Release.*S02.*1080p.*WEB.*",
+]
+
+# ...and dropped if it matches ANY of these. Reject wins over match.
+regex_for_downloads_reject_match = [
+    "(?i).*NORDIC.*",
+    "(?i).*GERMAN.*",
+]
+
+# How to pull the release name and torrent id out of an announce line. The two
+# named captures `name` and `id` are required; the rest depends on your
+# network's announce format. This is the one you will have to write yourself.
+regex_for_announce_match = '''.*Name:'(?P<name>.*)' uploaded by.*https://tracker.example.org/torrent/(?P<id>\d+)'''
+
+# ---------------------------------------------------------------------------
+# Tracker
+# ---------------------------------------------------------------------------
+
+# The table key is a label of your choosing — it is what gets logged, nothing
+# more. irc2torrent drives exactly one tracker, so there is exactly one of these.
+[platform.YourTracker]
+
+# Where a .torrent is fetched from. There is no default: this is the one field
+# that cannot be guessed, and guessing it wrong means fetching from somebody
+# else's site. Copy the URL your tracker's "download" button produces and
+# replace the varying parts with placeholders:
+#
+#   {id}    the `id` capture from regex_for_announce_match
+#   {name}  the `name` capture, verbatim from IRC
+#   {file}  the sanitised filename actually written to torrent_dir,
+#           ".torrent" included
+#   {key}   rss_key, below
+#
+# Write `{{` or `}}` for a literal brace. Anything else in braces is an error at
+# startup rather than a 404 later.
+#
+# {name} and {id} come straight off IRC, so every substituted value is
+# percent-encoded and the host is re-checked before the request goes out — a
+# placeholder in the host or port is refused outright, since no escaping could
+# make that safe.
+#
+# Two shapes, as examples:
+#   https://tracker.example.org/rss/download/{id}/{key}/{file}
+#   https://tracker.example.org/download/{id}/{file}?passkey={key}
+download_url_template = "https://tracker.example.org/rss/download/{id}/{key}/{file}"
+
+# Your per-user RSS/download key. A secret: it is never logged, and never put
+# in an error message. Only needed if download_url_template mentions {key}.
+rss_key = "XXXXXXXXXXXXXXXXXXXX"
+
+# Where fetched .torrent files are cached. Must be writable — in the container
+# the root filesystem is read-only, so use a path under /config or /downloads.
+torrent_dir = "/downloads/.torrents"
+
+# ---------------------------------------------------------------------------
+# Torrent client
+# ---------------------------------------------------------------------------
+#
+# Two are fully supported: rTorrent and qBittorrent. Flood can only be added to
+# — it cannot list torrents or report completions, so cmd:torrentlist and
+# download-finished notifications do not work against it.
+#
+# `[[clients]]` is an array, but only the FIRST entry is used. To switch client,
+# reorder them; a second entry is ignored (and warned about in the log).
+#
+# Changing this needs a restart.
+
+[[clients]]
+
+[clients.rTorrent]
+# ONE slash after `unix:`, not two. `unix://` opens a URL authority, so the
+# first path segment is parsed as a hostname and the socket path silently
+# loses it.
+xmlrpc_url = "unix:/config/.local/share/rtorrent/rtorrent.sock"
+
+# qBittorrent instead — put this block first, or delete the rTorrent one.
+#
+# [[clients]]
+#
+# [clients.qBittorrent]
+# The WebUI address. Prefer the literal address over `localhost`: which family
+# that resolves to inside a container is not worth gambling on.
+# url = "http://127.0.0.1:8080"
+#
+# Leave both empty if qBittorrent bypasses authentication for localhost, which
+# is what the bundled qBittorrent image ships — the bot only logs in when the
+# server actually asks it to.
+# username = ""
+# password = ""
+#
+# Empty means whatever qBittorrent is already configured to use.
+# save_path = ""
+# category  = ""
+
+# ---------------------------------------------------------------------------
+# Commands over IRC
+# ---------------------------------------------------------------------------
+#
+# Private-message the bot. Short forms:
+#   at! <link|id|announce line>   add a torrent, ignoring the filters
+#   lt!                           list torrents
+#   lw!                           list watch patterns, numbered
+#   aw! <regex>                   add a watch pattern
+#   rw! <index>                   remove the pattern at that index
+#   tn!                           send a test notification
+#   s!                            discard replies still queued (alerts kept)
+#   h!                            list all of them, in both forms
+# Long form: cmd:<name> params:(<argument>)
+#
+# The same commands work over Telegram and Slack; only this section's settings
+# are IRC's.
+
+[command_options]
+# Off by default. Read the Security section of the README before enabling.
+commands_enabled = false
+
+# Require the sender to be identified to network services (NickServ) before any
+# command runs. On by default, and worth leaving on: without it the only
+# credential is a nickname, and on a network that does not enforce registration
+# anyone can take yours the moment you disconnect.
+#
+# Each command costs one WHOIS round trip. The bot accepts the command only if
+# services report the sender logged in to an account matching the IrcUserName
+# below — so set that to your *services account* name, which is usually but not
+# always the same as your nick.
+#
+# Set to false only if your network has no services; commands are otherwise
+# refused with a message saying exactly that.
+require_identified = true
+
+# How many lines a listing (cmd:torrentlist, cmd:watchlist) may answer with,
+# over IRC. Each line is a separate PRIVMSG, and IRC servers kill clients that
+# send too many too fast — a 20-line reply was enough to be dropped for excess
+# flood.
+#
+# This does NOT apply to Telegram or Slack: neither has a per-line limit or a
+# flood limit worth pacing for, so a listing arrives whole there however low
+# this is set.
+#
+# Anything beyond the cap is reported as "… and N more (not shown)", never
+# silently dropped, and the header always states the true total.
+#
+# Raising this alone is not enough: also raise `max_messages_in_burst` in
+# irc.toml, and know your network's flood limit. irc2torrent defaults that to
+# 5 messages per 8 seconds (the irc crate's own default of 15 is what got the
+# bot killed, because it releases all 15 instantly before throttling).
+max_reply_lines = 12
+
+[command_options.security_mode]
+# Only this nick may command the bot, by private message. It is also who
+# `[notifications.irc]` messages.
+IrcUserName = "YourNick"
+
+# Alternatively, authenticate by shared secret in the message itself:
+#   [command_options.security_mode]
+#   Password = "some-long-secret"
+# The bot redacts `auth:[...]` from its logs. Note that IRC private messages
+# are not encrypted end to end, so the operator of the network can read it.
+
+# ---------------------------------------------------------------------------
+# Telegram — notifications AND commands
+# ---------------------------------------------------------------------------
+#
+# The best place to run commands from: 4096 characters per message, so a whole
+# torrent listing arrives in one piece instead of being paced out line by line,
+# and the sender is a numeric ID that cannot be taken the way a nick can.
+#
+# Step-by-step setup, including the "message your bot first" trap that otherwise
+# produces `chat not found`: docs/integrations.md
+#
+# The bot has no phone number of its own; create it by messaging @BotFather.
+
+# [telegram]
+# token    = "123456789:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw"   # from @BotFather
+# owner_id = 987654321                                        # from @userinfobot
+#
+# Both roles are on by default. Turn either off on its own:
+#   commands      = false    # notifications only
+#   notifications = false    # commands only
+
+# The same event filter as every other target; anything unstated inherits the
+# globals under [notifications].
+# [telegram.events]
+# on_torrent_added = false
+
+# ---------------------------------------------------------------------------
+# Slack — notifications AND commands
+# ---------------------------------------------------------------------------
+#
+# The only integration here that needs no phone number at any point.
+#
+# Receiving uses Socket Mode — the bot dials out over a WebSocket, so there is
+# no public URL, no inbound port and nothing to forward.
+#
+# SETTING IT UP — docs/integrations.md has the click-by-click version, including
+# an app manifest you can paste at api.slack.com/apps → Create New App → From an
+# app manifest, which configures everything below except the tokens themselves.
+# The summary, if you would rather click:
+#
+#   Bot Token Scopes  (OAuth & Permissions — the BOT list, not the User one)
+#     chat:write                          always
+#     im:write + im:history               a direct message (the default here)
+#     channels:history | groups:history   a public | private channel
+#
+#   Subscribe to bot events  (Event Subscriptions)
+#     message.im | message.channels | message.groups   — matching the above
+#
+#   App Home → Messages Tab                DM setups only, and easy to miss:
+#     leave it off and Slack will not let you type to the bot at all, with no
+#     error anywhere to say why.
+#
+#   Reinstall the app after changing any scope, or the change does not take.
+
+# [slack]
+# Two tokens, and they are NOT interchangeable. Swapping them fails with
+# `not_allowed_token_type`, which names neither of them.
+#
+#   app_token  Basic Information → App-Level Tokens, scope connections:write.
+#              Shown once; generate another if you lose it.
+#   bot_token  OAuth & Permissions → Bot User OAuth Token, after installing.
+#              Install stays greyed out until at least one bot scope exists.
+#
+# app_token = "xapp-1-A01234567-1234567890123-abcdef"   # opens the socket
+# bot_token = "xoxb-1234567890-1234567890123-abcdef"    # posts messages
+#
+# The only person the bot obeys. A member ID, not a display name, and
+# case-sensitive: Profile → ⋮ → Copy member ID.
+# owner_id  = "U01234567"
+#
+# WHERE it talks. Left out — as here — the bot messages owner_id directly, which
+# is the private option and needs no channel and no invite.
+#
+# Set it and the bot uses that channel instead: everyone in it sees the replies,
+# and a torrent listing is not usually meant for an audience. Worth it only if
+# you want a shared record of what the bot is doing. The ID is at the bottom of
+# the channel's About tab, and the bot has to be /invite'd.
+# channel_id = "C01234567"
+#
+# Both roles are on by default, as for Telegram:
+#   commands      = false    # notifications only
+#   notifications = false    # commands only
+
+# [slack.events]
+# on_torrent_added = false
+
+# ---------------------------------------------------------------------------
+# Notifications
+# ---------------------------------------------------------------------------
+#
+# Everything in this section is a one-way sink: it receives notifications but
+# cannot carry commands. Telegram, Slack (above) and IRC do both.
+#
+# Every backend is opt-in: a backend is enabled only when its table is present
+# AND usable. With no backend table, nothing is sent and nothing is computed.
+#
+# Check your setup with `cmd:testnotify` — it ignores every switch below and
+# goes out immediately, so it answers "is this working?" in one message.
+
+[notifications]
+
+# -- which events -----------------------------------------------------------
+# These are the defaults for every backend; each backend can override any of
+# them in its own [..events] table.
+
+# Add failures, service crash loops, a rejected config reload, and IRC being
+# down for more than a minute.
+on_failure = true
+
+# Every successful add. Off by default — an announce channel is busy, and with
+# a broad watchlist this is the setting people turn on and immediately regret.
+on_torrent_added = false
+
+# A torrent reaching 100%. Discovered by polling the client (see
+# poll_seconds); torrents already complete when irc2torrent starts are treated
+# as history, not news.
+on_download_finished = true
+
+# Free space on disk_path dropping below disk_warn_percent.
+on_disk_low = true
+
+# One roll-up per day: added / finished / failed / restarts.
+daily_summary = false
+
+# The bot coming up — "irc2torrent 0.13.0 is up (commands, ntfy, telegram)" —
+# and IRC coming back after an outage you were told about.
+#
+# On by default: it happens once per start, it is how you confirm a restart or a
+# config change took, and the integration list is where a typo in [slack] shows
+# up as Slack simply not being named.
+#
+# Sent about 20 seconds after startup, not on the first digest — waiting out a
+# 300-second window to learn the bot came up looks exactly like it not having.
+# A container's network is often still not up at 20s; that is fine, because a
+# failed delivery is held and retried every 30s for up to six attempts.
+#
+# A crash loop collapses into "(x40)" like any other repeat.
+on_start = true
+
+# -- shaping ----------------------------------------------------------------
+
+# Events are buffered this long and sent as ONE message, with repeats collapsed
+# into a count. This is what makes notifications usable on a busy channel:
+# forty crash-loop restarts arrive as "rtorrent was restarted (x40)".
+# Lower it if you want to be told sooner; 0 is treated as 1 second.
+digest_seconds = 300
+
+# Hard ceiling per backend per hour. Nothing is silently lost: the next message
+# that does go out says how many were suppressed.
+#
+# A retry is not charged again — the message already spent its allowance on the
+# attempt that failed, so a network blip cannot eat the hour's budget.
+max_per_hour = 20
+
+# How often to ask the client what has finished, and to check free space.
+poll_seconds = 120
+
+# Filesystem to watch for on_disk_low. If this path does not exist you get one
+# warning in the log rather than a notification every poll.
+disk_path = "/downloads"
+disk_warn_percent = 10.0
+
+# -- email ------------------------------------------------------------------
+#
+# Usually two lines. The SMTP host is looked up from the address's domain, the
+# port and TLS mode follow from convention (587 STARTTLS, 465 implicit TLS),
+# and both `from` and `to` default to `address` — you are mailing yourself.
+#
+# Gmail, Yahoo and iCloud REJECT your account password. You need an
+# app-specific password; see the README for the links. If auth fails against
+# one of those providers the error says so explicitly.
+
+# [notifications.email]
+# address  = "you@gmail.com"
+# password = "abcd efgh ijkl mnop"
+#
+# Keep the secret out of this file instead — first match wins:
+#   password_file = "/run/secrets/smtp_password"      # trailing newline is trimmed
+# or set IRC2TORRENT_SMTP_PASSWORD in the environment.
+#
+# Only needed for a provider that is not in the built-in table, or a server on
+# a non-standard port:
+#   host = "smtp.example.org"
+#   port = 587
+#   from = "bot@example.org"
+#   to   = "you@example.org"
+
+# Per-backend event overrides. Anything not stated here inherits the global
+# switch above.
+# [notifications.email.events]
+# on_torrent_added = true
+
+# -- ntfy -------------------------------------------------------------------
+#
+# The lowest-friction option: no account, no API key. Pick an unguessable
+# topic, subscribe to it in the ntfy app or at https://ntfy.sh/<topic>, and
+# that is the whole setup.
+#
+# Anyone who knows the topic on the public server can read your notifications,
+# so treat it as a secret.
+
+# [notifications.ntfy]
+# topic = "irc2torrent-8f3a9c1d4b7e"
+#
+# A full URL instead of a bare topic points at a self-hosted server:
+#   topic = "https://ntfy.example.org/irc2torrent"
+#   token = "tk_..."          # only if your server requires auth
+
+# A good use of per-backend filters: phone push for things that need you, mail
+# for the rest.
+# [notifications.ntfy.events]
+# on_torrent_added     = false
+# on_download_finished = false
+# daily_summary        = false
+
+# -- IRC private message ----------------------------------------------------
+#
+# Zero configuration: the bot is already connected and already knows your nick
+# from command_options.security_mode. The empty table is enough to enable it.
+#
+# Requires security_mode = IrcUserName; in Password mode there is no nick to
+# message.
+#
+# The bot checks whether you are actually online (ISON, once a minute). A
+# PRIVMSG to an absent nick is discarded by the server with no error, so
+# messages sent while you are away are held and delivered when you reappear —
+# up to 20 of them, oldest dropped first.
+#
+# Still best-effort: anything held is lost if the bot restarts, and nothing can
+# be sent at all while the bot itself is disconnected, which is exactly when
+# on_failure matters most. Do not make this your only backend.
+
+# [notifications.irc]
+
+# [notifications.irc.events]
+# on_download_finished = true

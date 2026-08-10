@@ -1,0 +1,26 @@
+/target
+.idea/*
+.idea
+*.iml
+
+# Cargo.lock IS committed. This is a binary crate, not a library: Cargo's own
+# guidance is to commit the lock file so builds are reproducible. It also has to
+# exist for `cargo build --locked` in the Dockerfile and CI, and without it the
+# dependency pinning done for the security audit would not apply to anyone
+# else's build.
+
+*.sh
+# ...except the build entrypoint, which the Dockerfile and README both document.
+!docker/*.sh
+
+**.DS_Store
+*.stackdump
+
+# The runtime config files. These normally live in $HOME/.config, but they are
+# the two that hold real secrets -- rss_key and nick_password -- so a stray copy
+# in the working tree must never become a commit.
+options.toml
+irc.toml
+
+# Exported CI logs, kept locally for diagnosis only.
+logs_of_last_ci_run/

@@ -1,0 +1,136 @@
+#############################################################################
+# rTorrent configuration for the flood_rtorrent_irc2torrent image.
+#
+# Targets rakshasa/rtorrent 0.16.x.
+#
+# Paths deliberately match the previous jesec-based image so existing /config
+# volumes and unmodified options.toml files keep working:
+#   $HOME              = /config
+#   rTorrent base dir  = /config/.local/share/rtorrent
+#   SCGI socket        = /config/.local/share/rtorrent/rtorrent.sock
+# That socket path is irc2torrent's own default (see rTorrentOptions::default
+# in src/config.rs), so no client config change is needed.
+#
+# Two classes of command are avoided here:
+#   * `fs.*` (fs.mkdir, fs.homedir, ...) -- jesec-fork only, absent upstream.
+#     Directories are created by the supervisor before rTorrent starts.
+#   * deprecated names (schedule2, network.port_range.set, execute2,
+#     network.http.max_open.set) -- upstream only registers those under `-D`,
+#     since method.use_deprecated now defaults to false.
+#
+# Extend rather than replace:
+#     import = /etc/rtorrent/rtorrent.rc
+#############################################################################
+
+## Paths ####################################################################
+directory.default.set = /downloads
+session.path.set      = /config/.local/share/rtorrent/.session
+
+
+## Issue #443 -- disk read amplification ####################################
+# rTorrent serves chunks via mmap(); default kernel readahead then pulls in far
+# more than the piece being sent, producing 4-100x more disk reads than upload
+# traffic. advise_random turns kernel readahead off; pieces.preload lets
+# rTorrent do its own readahead instead.
+#
+# Both flags default to false upstream, so this block is what actually fixes
+# the problem -- do not remove it. `.hashing` stays at 0 because hash checking
+# genuinely wants sequential readahead.
+
+system.files.advise_random.set = 1
+pieces.preload.type.set        = 1
+pieces.preload.min_size.set    = 262144
+pieces.preload.min_rate.set    = 5120
+
+
+## Memory / file descriptors ################################################
+#pieces.memory.max.set = 2G
+network.max_open_files.set             = 512
+system.sockets.max_size.set            = 512
+network.http.max_total_connections.set = 48
+
+
+## RPC ######################################################################
+# Unix socket only, never a TCP port. Both dialects stay enabled: irc2torrent
+# speaks XML-RPC, Flood prefers JSON-RPC and auto-detects.
+network.scgi.open_local     = /config/.local/share/rtorrent/rtorrent.sock
+network.rpc.use_xmlrpc.set  = true
+network.rpc.use_jsonrpc.set = true
+
+schedule = socket_chmod, 0, 0, ((execute.nothrow, chmod, 0770, /config/.local/share/rtorrent/rtorrent.sock))
+
+
+## Added timestamps #########################################################
+# rTorrent keeps no "date added" of its own and Flood reads one from the
+# `addtime` custom field, so something has to write it. This covers every
+# torrent however it arrived -- web UI, watch dir, RPC.
+method.set_key = event.download.inserted_new, addtime,\
+    "d.custom.set=addtime,(cat,(system.time))"
+
+# A `fix_addtime` method used to live here for irc2torrent to call after each
+# add:
+#     d.custom.set=addtime,(cat,$d.creation_date=)
+# It was actively harmful. `d.creation_date` is the date baked into the
+# .torrent, not when it was added, and it is 0 for any torrent carrying no
+# `creation date` key -- so calling it right after the handler above
+# *overwrote* a correct timestamp with "0", and Flood showed an empty Added
+# column. irc2torrent >= 0.7.2 sets `addtime` itself and no longer needs it.
+
+
+## Network ##################################################################
+network.listen.port.range.set  = 50000-50000
+network.listen.port.random.set = no
+
+dht.mode.set     = auto
+dht.port.set     = 50001
+protocol.pex.set = yes
+
+# Upstream uses dht.add_node; `dht.add_bootstrap` is jesec-only.
+dht.add_node = dht.transmissionbt.com:6881
+dht.add_node = dht.libtorrent.org:25401
+
+protocol.encryption.set = allow_incoming,enable_retry,prefer_plaintext
+
+
+## Throttling ###############################################################
+throttle.max_uploads.set        = 50
+throttle.max_uploads.global.set = 250
+throttle.min_peers.normal.set   = 20
+throttle.max_peers.normal.set   = 60
+throttle.min_peers.seed.set     = 30
+throttle.max_peers.seed.set     = 80
+trackers.numwant.set            = 80
+
+throttle.global_down.max_rate.set_kb = 0
+throttle.global_up.max_rate.set_kb   = 0
+
+
+## Behaviour ################################################################
+pieces.hash.on_completion.set = no
+system.umask.set = 0027
+# NOTE: no `encoding.add = utf8` -- upstream removed encoding name/path
+# attribute handling in fd69baa; the command no longer exists.
+
+schedule = monitor_diskspace, 15, 60, ((close_low_diskspace, 1000M))
+schedule = session_save, 1200, 1200, ((session.save))
+
+
+## Logging ##################################################################
+# rTorrent has no built-in "stderr" sink, and /dev/stderr cannot be reopened
+# after privileges drop, so log to a file:
+#   docker exec <container> tail -f /config/.local/share/rtorrent/log/rtorrent.log
+# append_file, not open_file: open_file truncates, so every restart destroyed
+# the log of whatever caused the previous exit -- the one thing worth reading.
+# The .flush variant matters just as much: without it entries sit in the
+# ofstream buffer, and an abrupt death loses exactly the last lines before it.
+# Flushing per line is affordable at "warn".
+#
+# The supervisor rolls this to rtorrent.log.1 when it grows past ~16MB, since
+# rTorrent has no rotation of its own and an appended log otherwise grows
+# without bound.
+log.append_file.flush = "rtorrent", "/config/.local/share/rtorrent/log/rtorrent.log"
+log.add_output = "warn", "rtorrent"
+
+
+## Daemon ###################################################################
+system.daemon.set = true

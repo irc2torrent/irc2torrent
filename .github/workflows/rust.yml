@@ -1,0 +1,269 @@
+name: Rust
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+    # main as well as tags, purely so the caches have somewhere to live.
+    #
+    # GitHub scopes its Actions cache by ref and a run may only read its own
+    # scope or the default branch's. With this job running on tags alone, every
+    # tag wrote a scope nothing would ever read again, and Swatinem/rust-cache
+    # reported "No cache found." on every release -- 2m15s of rebuilding.
+    # Populating main's scope is what makes tag runs able to restore anything.
+    #
+    # The image job is unaffected: its `if` still restricts it to tags and
+    # manual runs, so a push to main runs the tests and nothing else.
+    branches:
+      - main
+  # NOTE: `pull_request` does not support a `tags:` filter -- only branches,
+  # paths and types. The previous version of this file had `pull_request: tags:`,
+  # which makes GitHub reject the entire workflow as invalid, so nothing ran at
+  # all (including the tag push trigger above).
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      libtorrent_ref:
+        description: "Ref of irc2torrent/libtorrent to build against"
+        default: "fix/aclocal-amflags-libtool-2.5.4"
+      rtorrent_ref:
+        description: "Ref of irc2torrent/rtorrent to build against"
+        default: "fix/aclocal-amflags-libtool-2.5.4"
+      flood_ref:
+        description: "Ref of irc2torrent/flood to build against"
+        default: "master"
+      platforms:
+        description: "Target platforms (add linux/arm64 only when needed; it is QEMU-emulated and takes hours)"
+        default: "linux/amd64"
+
+env:
+  CARGO_TERM_COLOR: always
+  IMAGE: irc2torrent/flood_rtorrent_irc2torrent
+  # The second image: qBittorrent in place of rTorrent, same Flood and bot.
+  # Built in the same job rather than its own so it shares the flood-build and
+  # irc2torrent-build stages -- a separate job would get a separate cache scope
+  # and rebuild the ~18-minute Rust dependency layer a second time.
+  QBT_IMAGE: irc2torrent/flood_qbittorrent_irc2torrent
+  # rTorrent and libtorrent are built from our forks, at the branch carrying the
+  # ACLOCAL_AMFLAGS fix. That fix is not optional: without it, autoreconf fails
+  # outright on libtool >= 2.5.4 (Alpine 3.22+). Move these to "master" once the
+  # change has landed upstream.
+  DEFAULT_LIBTORRENT_REF: fix/aclocal-amflags-libtool-2.5.4
+  DEFAULT_RTORRENT_REF: fix/aclocal-amflags-libtool-2.5.4
+  DEFAULT_FLOOD_REF: master
+
+jobs:
+  test:
+    name: Build and test
+    runs-on: ubuntu-latest
+    steps:
+      # dxr is vendored in-tree, not a submodule, so a plain checkout is enough.
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --locked --verbose
+      - name: Test
+        # The ignored tests need a live rTorrent socket and Flood server.
+        run: cargo test --locked --verbose
+      # rustsec/audit-check compiles cargo-audit from source on every run, which
+      # measured 5m38s of an 8 minute job -- more than the build and the tests
+      # put together. A prebuilt binary takes seconds and runs the same audit.
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@cargo-audit
+
+      - name: Audit
+        run: cargo audit
+
+  build_docker_image:
+    name: Build and push image
+    runs-on: ubuntu-latest
+    needs: test
+    # Tag pushes and manual runs only: a pull request must not publish an image.
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    steps:
+      # dxr is vendored in-tree, not a submodule, so a plain checkout is enough.
+      - name: Checkout irc2torrent
+        uses: actions/checkout@v5
+
+      - name: Checkout libtorrent
+        uses: actions/checkout@v5
+        with:
+          repository: irc2torrent/libtorrent
+          ref: ${{ github.event.inputs.libtorrent_ref || env.DEFAULT_LIBTORRENT_REF }}
+          path: .contexts/libtorrent
+
+      - name: Checkout rtorrent
+        uses: actions/checkout@v5
+        with:
+          repository: irc2torrent/rtorrent
+          ref: ${{ github.event.inputs.rtorrent_ref || env.DEFAULT_RTORRENT_REF }}
+          path: .contexts/rtorrent
+
+      - name: Checkout flood
+        uses: actions/checkout@v5
+        with:
+          repository: irc2torrent/flood
+          ref: ${{ github.event.inputs.flood_ref || env.DEFAULT_FLOOD_REF }}
+          path: .contexts/flood
+
+      # ---------------------------------------------------------------------
+      # Make the named contexts byte-stable between runs.
+      #
+      # The repository .dockerignore excludes .git, but it only applies to the
+      # main context -- BuildKit looks for a .dockerignore *inside* each named
+      # context, and a freshly checked-out repo has none. So .git went into the
+      # build context, and it differs on every checkout (index stat data, packs,
+      # FETCH_HEAD, reflogs). That changed the context digest, missed
+      # `COPY --from=libtorrent . .`, and rebuilt libtorrent and rTorrent from
+      # source every run: 574s + 559s of the last build.
+      #
+      # Dropping .git leaves a plain source tree at a pinned ref, which hashes
+      # the same every time.
+      # ---------------------------------------------------------------------
+      - name: Strip VCS metadata from the build contexts
+        run: rm -rf .contexts/*/.git
+
+      - name: Set output
+        id: vars
+        run: echo "tag=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      # ---------------------------------------------------------------------
+      # Both logins MUST come before the build.
+      #
+      # The base images live on dhi.io, which requires authentication, so the
+      # build fails at the very first FROM if login runs afterwards. (The
+      # previous workflow built first and logged in only to push, which worked
+      # solely because the bases were public.)
+      # ---------------------------------------------------------------------
+      - name: Login to Docker Hardened Images registry
+        uses: docker/login-action@v3
+        with:
+          registry: dhi.io
+          username: ${{ secrets.DHI_USERNAME || secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DHI_TOKEN || secrets.DOCKERHUB_TOKEN }}
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          target: runtime
+          # Same named contexts the local build.sh uses, so CI and local builds
+          # consume identical sources.
+          build-contexts: |
+            libtorrent=.contexts/libtorrent
+            rtorrent=.contexts/rtorrent
+            flood=.contexts/flood
+          # amd64 only by default. GitHub's runners are x86, so linux/arm64
+          # builds under QEMU emulation -- roughly 10-30x slower, and this image
+          # compiles 135 libtorrent + 101 rtorrent translation units, 293 Rust
+          # crates and a full Flood pnpm build *per architecture*. That is what
+          # turned a ~25 minute release into a 4+ hour one.
+          #
+          # Need arm64? Run the workflow manually and set the `platforms` input
+          # to "linux/amd64,linux/arm64" and expect the wait. The lasting fix is
+          # a per-arch matrix on native ubuntu-24.04-arm runners merged with
+          # `docker buildx imagetools create`.
+          platforms: ${{ github.event.inputs.platforms || 'linux/amd64' }}
+          push: ${{ github.event_name == 'push' }}
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.vars.outputs.tag }}
+            ${{ env.IMAGE }}:latest
+          # Registry cache, not type=gha.
+          #
+          # GitHub scopes its Actions cache by ref, and a run may only read its
+          # own scope or the default branch's. This job runs on tag pushes, and
+          # every tag is its own ref -- so v0.8.0 could never read what v0.7.5
+          # wrote, and nothing ever populated the main-branch scope because the
+          # job never runs on main. `type=gha` was a guaranteed miss on every
+          # release, which is why rTorrent, libtorrent and Flood were rebuilt
+          # from source each time even when only the Rust source had changed.
+          #
+          # A registry tag has no ref scoping and no 10 GB repository limit, and
+          # we are already authenticated to push it.
+          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache
+          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache,mode=max
+
+      - name: Verify the image really used our forks
+        if: github.event_name == 'push'
+        run: |
+          # A stale layer cache would silently produce an old rTorrent, so assert
+          # the version rather than trusting the build succeeded.
+          docker run --rm --entrypoint /usr/local/bin/rtorrent \
+            ${{ env.IMAGE }}:${{ steps.vars.outputs.tag }} -h | head -1
+
+      # -----------------------------------------------------------------------
+      # The qBittorrent image. No libtorrent or rtorrent context: BuildKit
+      # prunes every stage outside the target's graph, so those trees are never
+      # read. flood-build and irc2torrent-build ARE shared, and the cache above
+      # is still warm from the build that just ran.
+      # -----------------------------------------------------------------------
+      - name: Build and push the qBittorrent image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          target: qbt-runtime
+          build-contexts: |
+            flood=.contexts/flood
+          platforms: ${{ github.event.inputs.platforms || 'linux/amd64' }}
+          push: ${{ github.event_name == 'push' }}
+          tags: |
+            ${{ env.QBT_IMAGE }}:${{ steps.vars.outputs.tag }}
+            ${{ env.QBT_IMAGE }}:latest
+          cache-from: |
+            type=registry,ref=${{ env.IMAGE }}:buildcache
+            type=registry,ref=${{ env.QBT_IMAGE }}:buildcache
+          cache-to: type=registry,ref=${{ env.QBT_IMAGE }}:buildcache,mode=max
+
+      - name: Verify the qBittorrent image
+        if: github.event_name == 'push'
+        run: |
+          set -euo pipefail
+          IMG=${{ env.QBT_IMAGE }}:${{ steps.vars.outputs.tag }}
+
+          # The whole DT_NEEDED closure, from a shell-less image.
+          docker run --rm --entrypoint /usr/bin/qbittorrent-nox "$IMG" --version
+
+          docker run -d --name qbt --read-only --tmpfs /tmp "$IMG"
+
+          # One line proves the lot: the Qt plugin staging, the seeded ini, the
+          # legal-notice flag, the TCP readiness gate, the localhost auth bypass
+          # and the client's own connect. If it is absent, one of those broke.
+          for i in $(seq 1 60); do
+            docker logs qbt 2>&1 | grep -q "Connected to qBittorrent, WebAPI" && break
+            sleep 2
+          done
+          docker logs qbt 2>&1 | grep "Connected to qBittorrent, WebAPI" \
+            || { echo "the bot never reached qBittorrent"; docker logs qbt; exit 1; }
+
+          # QSettings ignores a key it does not recognise, silently, so the only
+          # way to know the shipped 5.x ini actually applied is to read it back.
+          docker run --rm --network container:qbt curlimages/curl:latest \
+            -sf http://127.0.0.1:8080/api/v2/app/preferences \
+            | grep -q '"save_path":"/data"' \
+            || { echo "the seeded qBittorrent.conf did not apply"; exit 1; }
+
+          docker rm -f qbt
+
+          # Qt's TLS backend is dlopen'd, so it appears in no ldd listing and a
+          # missing one shows up only as HTTPS trackers silently never
+          # announcing -- the daemon starts and seeding works. Asserted
+          # positively, by extracting the file: `docker cp` needs no shell in
+          # the image and fails loudly when the path is not there.
+          docker create --name qbtfiles "$IMG" >/dev/null
+          docker cp qbtfiles:/usr/lib/qt6/plugins/tls/libqopensslbackend.so /tmp/tls.so
+          test -s /tmp/tls.so
+          docker rm qbtfiles >/dev/null

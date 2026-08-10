@@ -1,0 +1,51 @@
+[package]
+name = "dxr_client"
+description = "Declarative XML-RPC (client implementation)"
+categories = ["network-programming", "web-programming::http-client", "encoding"]
+keywords = ["XML-RPC", "client"]
+
+license.workspace = true
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+dxr.workspace = true
+log = "0.4.13"
+
+# reqwest support
+#
+# Bumped from reqwest 0.11 / http 0.2 to match the parent crate. Pinning the old
+# major kept a second, older copy of the entire HTTP+TLS stack in the tree, and
+# that copy is where RUSTSEC-2024-0421 (idna 0.3) and the three rustls-webpki
+# 0.101 advisories came from; the modern stack irc2torrent itself pulls in was
+# already clean.
+http = { version = "1.1", optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["cookies"], optional = true }
+thiserror = { version = "2", optional = true }
+url = { version = "2.5", optional = true }
+# tokio-scgi, tokio-util and bytes removed. The only thing they provided was
+# SCGI request framing, which is a dozen lines and is now inline in
+# reqwest_support.rs. tokio-scgi was last released in 2021 and pinned
+# tokio-util to 0.6, holding that whole branch of the tree back.
+tokio = { version = "1.0", features = ["io-util", "macros", "net", "rt-multi-thread"] }
+futures = "0.3.29"
+
+[features]
+# use the default TLS backend by default
+default = ["reqwest?/default-tls", "dxr/i8"]
+
+# multicall support
+multicall = ["dxr/multicall"]
+
+reqwest = ["dep:http", "dep:reqwest", "dep:thiserror", "dep:url"]
+
+default-tls = ["reqwest?/default-tls"]
+native-tls = ["reqwest?/native-tls"]
+rustls-tls = ["reqwest?/rustls-tls"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

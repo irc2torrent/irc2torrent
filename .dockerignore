@@ -1,0 +1,13 @@
+# target/ is several GB of Rust build artifacts. The Dockerfile copies only
+# Cargo.toml, Cargo.lock, irc.defaults.toml, src/ and dxr/, and BuildKit
+# transfers just what a COPY
+# references -- but excluding it here keeps that guarantee from depending on the
+# Dockerfile staying selective.
+target/
+dxr/target/
+
+.git/
+.github/
+.idea/
+*.md
+logs_of_last_ci_run/

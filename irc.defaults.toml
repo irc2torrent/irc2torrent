@@ -1,0 +1,74 @@
+# irc2torrent — IRC connection defaults
+#
+# This file IS the defaults: it is embedded at compile time and parsed to
+# produce the $HOME/.config/irc.toml written on first run. It used to be a
+# hand-maintained copy of the same values in src/config.rs, kept honest by a
+# test that noticed when the two drifted — which they had.
+#
+# Every key here is read by the `irc` crate, not by irc2torrent, so its
+# documentation applies:
+# https://docs.rs/irc/latest/irc/client/data/config/struct.Config.html
+
+nickname = "irc2torrent"
+nick_password = "password"
+# Fallbacks for when the nickname is already taken. A random suffix rather than
+# trailing underscores: `nick_` is what every other client falls back to as
+# well, so a collision on the nick is often followed by one on the alternative
+# — and after a netsplit the bot's own ghost may still be holding `nick`.
+#
+# The values below are examples. irc2torrent rolls fresh ones (0–10000) when it
+# generates your irc.toml, then leaves them alone so the nick stays stable
+# across restarts.
+alt_nicks = ["irc2torrent_4821", "irc2torrent_137", "irc2torrent_9604"]
+username = "irc2torrent"
+realname = "irc2torrent"
+
+# No default, because there is no sensible one: this is the announce network you
+# are entitled to be on. irc2torrent refuses to start until it is set.
+server = ""
+port = 6697
+
+# Must be stated explicitly: the crate treats a missing `use_tls` as "use TLS",
+# so leaving it out and pointing `port` at a plaintext listener fails the
+# handshake with InvalidMessage(InvalidContentType) rather than falling back.
+#
+# 6697/TLS is the default here deliberately — `nick_password` is sent over this
+# connection. If your network only offers a plaintext port, set `use_tls = false`
+# and change `port` to match, knowing the password crosses the network in clear.
+use_tls = true
+
+encoding = "UTF-8"
+
+# The announce channel(s) to watch. Empty means none: the bot still connects and
+# still answers commands sent to it directly, but nothing is ever auto-added.
+channels = []
+user_info = "I'm a bot user for the irc2torrent daemon."
+source = "https://github.com/irc2torrent/irc2torrent"
+
+# --- Flood protection -------------------------------------------------------
+#
+# How many messages may be sent before the client starts spacing them out, and
+# the window that is measured over. 5 per 8 seconds is roughly one message every
+# 1.6 seconds.
+#
+# These matter because a listing reply (cmd:torrentlist, cmd:watchlist) is one
+# PRIVMSG per line, and a long reply sent at full speed is enough to be killed
+# for excess flood.
+#
+# irc2torrent enforces this itself. The `irc` crate carries both keys on its
+# Config and even provides getters, but version 1.1.0 never reads either one and
+# contains no throttling code at all — they document behaviour it does not have.
+#
+# UNLIKE THE REST OF THIS FILE, these two apply immediately when saved. Server,
+# port and nickname are handed to the client when the connection is built and so
+# need a restart; these only govern how fast queued messages drain, so they can
+# be retuned mid-run — which is exactly when you want to, right after a network
+# has objected to the current setting.
+#
+# irc2torrent substitutes these values when they are absent, so an older
+# irc.toml gets them too; setting them here just makes the knob visible.
+#
+# Raising them without also raising `max_reply_lines` in options.toml achieves
+# nothing, and raising both past what your network tolerates gets you dropped.
+burst_window_length = 8
+max_messages_in_burst = 5

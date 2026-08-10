@@ -1,0 +1,15 @@
+# Everything checks out with LF, on every platform.
+#
+# This is not a style preference. The image is built from the working tree --
+# BuildKit named contexts and `COPY docker/rtorrent.rc` read files as they sit
+# on disk, not as they are stored in git. So a CRLF checkout ships CRLF files
+# into the image, and rTorrent's option parser rejects them outright:
+#
+#   Error in option file: /etc/rtorrent/rtorrent.rc:24: Invalid start of command name.
+#
+# On Windows with core.autocrlf=true that happens on a plain `git clone`, which
+# made it look like a build problem rather than a checkout one. `eol=lf`
+# overrides autocrlf, so the trap is closed for everyone rather than documented.
+#
+# `text=auto` still lets git detect and leave binary files alone.
+* text=auto eol=lf

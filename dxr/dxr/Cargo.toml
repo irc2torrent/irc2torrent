@@ -1,0 +1,52 @@
+[package]
+name = "dxr"
+description = "Declarative XML-RPC"
+categories = ["network-programming", "encoding"]
+keywords = ["XML-RPC", "client", "server", "derive"]
+exclude = ["/wip/"]
+
+license.workspace = true
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[test]]
+name = "derive"
+path = "tests/derive.rs"
+required-features = ["derive", "i8", "nil"]
+
+[dependencies]
+dxr_derive = { workspace = true, optional = true }
+base64 = "0.21"
+chrono = { version = "0.4.19", features = ["std"], default-features = false }
+# 0.30 carried RUSTSEC-2026-0194 (quadratic duplicate-attribute scan) and
+# RUSTSEC-2026-0195 (unbounded namespace-declaration allocation, a memory
+# exhaustion DoS). Both are reachable from parsing an untrusted XML-RPC reply.
+quick-xml = { version = "0.41", features = ["serialize"] }
+serde = { version = "1.0.104", features = ["derive"] }
+thiserror = "2.0"
+
+[dev-dependencies]
+chrono = { version = "0.4.19", features = ["clock", "std"], default-features = false }
+quickcheck = "1.0"
+quickcheck_macros = "1.0"
+trybuild = "1"
+
+[features]
+# support for derive macros
+derive =["dep:dxr_derive"]
+#default = ["i8"]
+# utilities for multicall support
+multicall = []
+
+# support non-standard <i8> XML-RPC values
+i8 = []
+
+# support non-standard <nil> XML-RPC values
+nil = []
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
