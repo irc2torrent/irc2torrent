@@ -418,5 +418,18 @@ disk_warn_percent = 10.0
 
 # [notifications.irc]
 
+# How long a notification may wait for you before it is dropped unsent.
+#
+# Holding is meant to cross a disconnect, not an absence. Without a limit,
+# coming back after a weekend delivered a weekend of alerts at once — every one
+# of them describing something that had resolved long before you read it.
+#
+# The default is 15 minutes. Raise it if you want a lunch break covered; set it
+# to 0 to hold nothing at all, so a notification that cannot be sent now is
+# dropped now. The count limit of 20 still applies inside whatever window you
+# choose, and nothing survives a restart either way.
+#
+# hold_seconds = 900
+
 # [notifications.irc.events]
 # on_download_finished = true
