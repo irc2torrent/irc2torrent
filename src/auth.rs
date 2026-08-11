@@ -36,6 +36,24 @@ pub enum AuthResult {
     NotAuthorized,
 }
 
+/// What to do with a command-shaped IRC message, decided before any round trip.
+///
+/// The three outcomes differ in what they *cost*, which is the whole point:
+/// only `Proceed` is allowed to spend a WHOIS, and only `Refuse` is allowed to
+/// send a reply.
+pub enum CommandGate {
+    /// Could be authorized. Worth verifying, and worth running.
+    Proceed,
+    /// Cannot be authorized -- but the sender has already shown they are using
+    /// the owner's nick in private, so an explanation costs one message to one
+    /// person rather than one per stranger.
+    Refuse(&'static str),
+    /// Cannot be authorized, and the sender is nobody in particular. Say
+    /// nothing: this is the path an attacker drives, and every reply on it is
+    /// a message the bot was made to send by someone with no claim on it.
+    Ignore,
+}
+
 pub enum MessageTypes {
     Command,
     Announcement,
@@ -141,6 +159,53 @@ impl Authorization {
                 Some(owner) if owner == user_id => SourceValidated,
                 _ => NotAuthorized,
             },
+        }
+    }
+
+    /// Whether a command-shaped message is worth spending anything on.
+    ///
+    /// The identity check is a WHOIS round trip, and it used to be spent
+    /// *before* authorization ran: `IrcProcessor` routes on `is_command`, which
+    /// is purely syntactic, so any stranger on the announce channel could make
+    /// the bot query the server -- on a default install too, where
+    /// `commands_enabled` is false and the command surface is meant to be off
+    /// entirely. The refusal that came back then named the owner's services
+    /// account, handing a piece of the config to anyone who typed `h!`.
+    ///
+    /// This settles the question from what is already known, for free.
+    ///
+    /// It must agree with `check_irc_command`, which makes the real decision
+    /// once the check completes: this may only decline what would be refused
+    /// there anyway. `the_gate_never_declines_what_the_real_check_allows` pins
+    /// that down.
+    pub fn gate_irc_command(&self, nick: &str, direct: bool) -> CommandGate {
+        let enabled = self.config.borrow().is_commands_enabled();
+        let mode = self.config.borrow().get_security_mode();
+
+        match mode {
+            // The credential *is* the sender, so the sender settles it.
+            SecurityMode::IrcUserName(_) => {
+                if !direct || !self.is_owner(nick) {
+                    CommandGate::Ignore
+                } else if !enabled {
+                    CommandGate::Refuse(
+                        "Commands are disabled on this bot. Set \
+                         command_options.commands_enabled = true to use them.",
+                    )
+                } else {
+                    CommandGate::Proceed
+                }
+            }
+            // The credential is inside the message, so nothing about the sender
+            // rules it out -- and nothing about them identifies the owner
+            // either, which is why this branch never explains itself to anyone.
+            SecurityMode::Password(_) => {
+                if enabled {
+                    CommandGate::Proceed
+                } else {
+                    CommandGate::Ignore
+                }
+            }
         }
     }
 
@@ -504,6 +569,118 @@ mod command_auth_test {
             auth.authorize_command(&request(Principal::Irc { nick: "owner".into() }, false)),
             NotAuthorized,
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // The pre-authorization gate
+    //
+    // The identity check used to be spent before authorization ran, so anyone
+    // who could type `h!` at the bot could make it query the server -- on a
+    // default install too, where commands are supposed to be off entirely.
+    // -----------------------------------------------------------------------
+
+    fn gate(mode: SecurityMode, enabled: bool) -> Authorization {
+        let mut cfg = Config::default_for_test();
+        cfg.set_for_test(mode, enabled);
+        Authorization::new(Rc::new(RefCell::new(cfg)))
+    }
+
+    /// The load-bearing property: the gate may only decline what the real check
+    /// would refuse anyway. If these ever disagree, the gate is silently
+    /// rejecting commands that ought to run.
+    #[test]
+    fn the_gate_never_declines_what_the_real_check_allows() {
+        for enabled in [true, false] {
+            for mode in [
+                SecurityMode::IrcUserName("owner".into()),
+                SecurityMode::Password("hunter2".into()),
+            ] {
+                for direct in [true, false] {
+                    for nick in ["owner", "stranger", "OWNER"] {
+                        let auth = gate(mode.clone(), enabled);
+                        let text = "cmd:torrentlist auth:[hunter2]";
+                        let origin = MessageOrigin::new(nick, if direct { nick } else { "#c" }, nick);
+
+                        // What the real check decides, given the gate let it by.
+                        let allowed = enabled
+                            && !matches!(
+                                auth.check_irc_command(&origin, direct, text),
+                                NotAuthorized
+                            );
+
+                        if allowed {
+                            assert!(
+                                matches!(auth.gate_irc_command(nick, direct), CommandGate::Proceed),
+                                "gate blocked an authorized command: {mode:?} enabled={enabled} \
+                                 direct={direct} nick={nick}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A stranger gets nothing at all: no round trip, and no reply either. The
+    /// reply mattered as much as the WHOIS -- refusing a stranger by name told
+    /// them the owner's services account.
+    #[test]
+    fn a_stranger_is_ignored_rather_than_answered() {
+        let auth = gate(SecurityMode::IrcUserName("owner".into()), true);
+        for (nick, direct) in [("stranger", true), ("stranger", false)] {
+            assert!(
+                matches!(auth.gate_irc_command(nick, direct), CommandGate::Ignore),
+                "{nick} direct={direct} should be ignored in silence"
+            );
+        }
+    }
+
+    /// Even the owner is ignored in a channel: a channel command can never be
+    /// authorized, and answering one is the loudest possible amplifier.
+    #[test]
+    fn the_owner_is_ignored_in_a_channel() {
+        let auth = gate(SecurityMode::IrcUserName("owner".into()), true);
+        assert!(matches!(auth.gate_irc_command("owner", false), CommandGate::Ignore));
+    }
+
+    /// Commands off is the default, and it must cost nothing. The owner is told
+    /// why -- that reply is reachable only by whoever holds the owner's nick in
+    /// private, so it is one message to one person, not one per stranger.
+    #[test]
+    fn commands_disabled_explains_itself_only_to_the_owner() {
+        let auth = gate(SecurityMode::IrcUserName("owner".into()), false);
+
+        let CommandGate::Refuse(why) = auth.gate_irc_command("owner", true) else {
+            panic!("the owner should be told why their command did nothing");
+        };
+        assert!(why.contains("commands_enabled"), "{why}");
+
+        assert!(matches!(auth.gate_irc_command("stranger", true), CommandGate::Ignore));
+    }
+
+    /// Nicks are case-insensitive here as everywhere else, or the gate would
+    /// silently drop the owner's own commands after a case change.
+    #[test]
+    fn the_gate_matches_the_owner_case_insensitively() {
+        let auth = gate(SecurityMode::IrcUserName("Owner".into()), true);
+        for nick in ["owner", "OWNER", "OwNeR"] {
+            assert!(
+                matches!(auth.gate_irc_command(nick, true), CommandGate::Proceed),
+                "{nick} is the owner"
+            );
+        }
+    }
+
+    /// Password mode cannot tell the owner from anyone else -- the credential is
+    /// in the message -- so it must not try, and must not explain itself either.
+    #[test]
+    fn password_mode_lets_everyone_through_the_gate_and_explains_nothing() {
+        let auth = gate(SecurityMode::Password("hunter2".into()), true);
+        assert!(matches!(auth.gate_irc_command("anyone", true), CommandGate::Proceed));
+        assert!(matches!(auth.gate_irc_command("anyone", false), CommandGate::Proceed));
+
+        let off = gate(SecurityMode::Password("hunter2".into()), false);
+        assert!(matches!(off.gate_irc_command("anyone", true), CommandGate::Ignore));
     }
 
     /// Password mode still reads the secret out of the message itself, and still
