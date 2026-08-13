@@ -237,7 +237,41 @@ jobs:
           # The whole DT_NEEDED closure, from a shell-less image.
           docker run --rm --entrypoint /usr/bin/qbittorrent-nox "$IMG" --version
 
-          docker run -d --name qbt --read-only --tmpfs /tmp "$IMG"
+          docker volume create qbtcfg >/dev/null
+          docker run -d --name qbt --read-only --tmpfs /tmp -v qbtcfg:/config "$IMG"
+
+          # --------------------------------------------------------------
+          # Give the bot a usable config before asking it to connect.
+          #
+          # It ships no tracker and no IRC server on purpose -- there is no
+          # sensible default for either -- so on a first run it writes both
+          # config files and then refuses to start until they are filled in.
+          # That is the intended behaviour, but it means the assertion below
+          # can no longer rely on the generated defaults being runnable.
+          #
+          # So: let it generate the files, fill in only the fields that have
+          # no shippable default, and restart. Restarting rather than waiting
+          # matters -- the supervisor's backoff has already grown to 60s by
+          # the time the files exist, and this resets it.
+          #
+          # The values are deliberately unreachable (example.org / example.net
+          # are reserved by RFC 2606). Nothing is downloaded and no IRC server
+          # is reached; the client connect asserted below happens first.
+          # --------------------------------------------------------------
+          for i in $(seq 1 30); do
+            docker run --rm -v qbtcfg:/config alpine \
+              test -f /config/.config/options.toml && break
+            sleep 2
+          done
+
+          docker run --rm -v qbtcfg:/config alpine sh -c '
+            cd /config/.config
+            sed -i "s|^download_url_template = \"\"|download_url_template = \"https://tracker.example.org/rss/download/{id}/{key}/{file}\"|" options.toml
+            sed -i "s|^rss_key = \"\"|rss_key = \"XXXXXXXX\"|" options.toml
+            sed -i "s|^server = \"\"|server = \"irc.example.net\"|" irc.toml
+            chown 1000:1000 options.toml irc.toml
+          '
+          docker restart qbt
 
           # One line proves the lot: the Qt plugin staging, the seeded ini, the
           # legal-notice flag, the TCP readiness gate, the localhost auth bypass
@@ -257,6 +291,7 @@ jobs:
             || { echo "the seeded qBittorrent.conf did not apply"; exit 1; }
 
           docker rm -f qbt
+          docker volume rm qbtcfg >/dev/null
 
           # Qt's TLS backend is dlopen'd, so it appears in no ldd listing and a
           # missing one shows up only as HTTPS trackers silently never
