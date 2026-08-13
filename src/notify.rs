@@ -272,9 +272,7 @@ impl Backend for TelegramBackend {
     async fn deliver(&self, subject: &str, body: &str) -> Result<(), Error> {
         // One message for both: splitting them would be two notifications for
         // one event.
-        let lines: Vec<String> =
-            std::iter::once(subject.to_string()).chain(body.lines().map(str::to_string)).collect();
-        self.telegram.send_lines(&lines).await
+        self.telegram.send_lines(&flat_lines(subject, body)).await
     }
 }
 
@@ -297,9 +295,7 @@ impl Backend for SlackBackend {
     }
 
     async fn deliver(&self, subject: &str, body: &str) -> Result<(), Error> {
-        let lines: Vec<String> =
-            std::iter::once(subject.to_string()).chain(body.lines().map(str::to_string)).collect();
-        self.slack.send_lines(&lines).await
+        self.slack.send_lines(&flat_lines(subject, body)).await
     }
 }
 
@@ -518,12 +514,21 @@ impl Backend for NtfyBackend {
     }
 
     async fn deliver(&self, subject: &str, body: &str) -> Result<(), Error> {
+        // The app name is the title; the events are the message.
+        //
+        // The title used to be `render`'s subject, which for a single event is
+        // that event's line -- so ntfy showed the line as the title and again
+        // as the message. Title and message are separate fields here, unlike
+        // Telegram or IRC, so the fix is to put the right thing in each rather
+        // than to suppress one: ntfy renders the title as the notification
+        // heading, which is where "who is telling me this" belongs.
+        let title = SUBJECT_PREFIX.trim_end_matches([':', ' ']);
         let mut req = self
             .client
             .post(&self.url)
             // Header, not body: ntfy takes the title out of band so the body
             // stays exactly what the user sees.
-            .header("Title", sanitize_header(subject))
+            .header("Title", sanitize_header(title))
             .body(body.to_string());
         if let Some(t) = &self.token {
             req = req.bearer_auth(t);
@@ -648,7 +653,7 @@ impl IrcBackend {
         subject: &str,
         body: &str,
     ) -> Result<(), Error> {
-        for line in std::iter::once(subject).chain(body.lines()).filter(|l| !l.trim().is_empty()) {
+        for line in flat_lines(subject, body).iter().filter(|l| !l.trim().is_empty()) {
             let line = crate::irc_processor::irc::sanitize_for_irc(line);
             // Queued, not sent: the pacer on the other end enforces the flood
             // limit that the irc crate advertises but never implements.
@@ -799,15 +804,42 @@ pub(crate) fn render(events: &[Event]) -> (String, String) {
     let subject = if order.len() == 1 {
         let (event, n) = &counts[&order[0]];
         if *n > 1 {
-            format!("irc2torrent: {} (x{n})", event.line())
+            format!("{SUBJECT_PREFIX}{} (x{n})", event.line())
         } else {
-            format!("irc2torrent: {}", event.line())
+            format!("{SUBJECT_PREFIX}{}", event.line())
         }
     } else {
-        format!("irc2torrent: {} events", events.len())
+        format!("{SUBJECT_PREFIX}{} events", events.len())
     };
 
     (subject, lines.join("\n"))
+}
+
+/// What every subject is prefixed with, so a notification says who sent it.
+pub(crate) const SUBJECT_PREFIX: &str = "irc2torrent: ";
+
+/// The single-message form, for transports with no separate subject field.
+///
+/// `render` returns a subject that, for a *single* event, is that event's line
+/// with the prefix on it -- which is right for email, where the subject is a
+/// real header and the body still has to carry the detail. Telegram, Slack and
+/// IRC have no such field: they concatenated subject and body, and so printed
+/// the line twice for every single-event notification, which is the common case.
+///
+/// Dropping the body line the subject already carries is exact rather than
+/// heuristic: the subject is only ever the prefix plus that line, `(xN)` suffix
+/// included, so stripping the prefix and comparing cannot match a line that
+/// merely looks similar. With several events the subject is "N events" and
+/// nothing is suppressed.
+fn flat_lines(subject: &str, body: &str) -> Vec<String> {
+    let carried = subject.strip_prefix(SUBJECT_PREFIX);
+    std::iter::once(subject.to_string())
+        .chain(
+            body.lines()
+                .filter(|l| carried != Some(*l))
+                .map(str::to_string),
+        )
+        .collect()
 }
 
 /// Long-running task that owns the targets and does the shaping.
@@ -1419,6 +1451,52 @@ mod test {
         assert_eq!(body, "Finished: Some Release");
     }
 
+    /// A transport with no subject field must not print the event twice.
+    ///
+    /// The subject for a single event *is* that event's line, which is correct
+    /// for email but meant Telegram, Slack and IRC sent
+    ///   irc2torrent: Finished: X
+    ///   Finished: X
+    /// for every single-event notification -- the common case.
+    #[test]
+    fn a_flat_transport_states_a_single_event_once() {
+        let (subject, body) = render(&[Event::DownloadFinished("Some Release".into())]);
+        assert_eq!(flat_lines(&subject, &body), vec!["irc2torrent: Finished: Some Release"]);
+    }
+
+    /// The same when the one event repeated: the subject carries the `(xN)`, so
+    /// the body line matches it exactly and is still suppressed.
+    #[test]
+    fn a_flat_transport_states_a_repeated_event_once() {
+        let events: Vec<Event> = (0..3).map(|_| started()).collect();
+        let (subject, body) = render(&events);
+        let lines = flat_lines(&subject, &body);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("(x3)"), "{lines:?}");
+    }
+
+    /// With more than one distinct event the subject is a count, so every line
+    /// still has to be sent -- suppression must not eat real content.
+    #[test]
+    fn a_flat_transport_keeps_every_line_of_a_digest() {
+        let events =
+            vec![Event::TorrentAdded("Alpha".into()), Event::DownloadFinished("Beta".into())];
+        let (subject, body) = render(&events);
+        let lines = flat_lines(&subject, &body);
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert_eq!(lines[0], "irc2torrent: 2 events");
+        assert!(lines[1].contains("Alpha"), "{lines:?}");
+        assert!(lines[2].contains("Beta"), "{lines:?}");
+    }
+
+    /// A line that merely resembles the subject is not suppressed: the match is
+    /// against the whole line after the prefix, not a substring.
+    #[test]
+    fn suppression_matches_the_whole_line_not_a_substring() {
+        let lines = flat_lines("irc2torrent: Finished: Some Release", "Finished: Some");
+        assert_eq!(lines.len(), 2, "{lines:?}");
+    }
+
     fn failure() -> Event {
         Event::AddFailed { name: "x".into(), reason: "y".into() }
     }
@@ -1977,10 +2055,20 @@ mod test {
         let lower = request.to_lowercase();
 
         assert!(request.starts_with("POST /my-topic "), "{request}");
-        assert!(lower.contains("title: irc2torrent: finished: some release"), "{request}");
         assert!(lower.contains("authorization: bearer hunter2"), "{request}");
+
+        // The title is who is telling you, the message is what happened.
+        //
+        // It used to be `render`'s subject, which for a single event is that
+        // event's line -- so ntfy showed the release name as the heading and
+        // again as the message. Title and message are separate fields here, so
+        // the fix is to put the right thing in each rather than blank one out.
+        assert!(lower.contains("title: irc2torrent\r\n"), "{request}");
+        assert!(!lower.contains("title: irc2torrent:"), "title still repeats the event: {request}");
+
         // The body is exactly what was rendered -- the title is out of band.
         assert!(request.ends_with("\r\n\r\nFinished: Some Release"), "{request}");
+        assert_eq!(request.matches("Finished: Some Release").count(), 1, "{request}");
     }
 
     /// A bare topic means the public server; only that shape is expanded.
