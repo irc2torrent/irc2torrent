@@ -582,12 +582,20 @@ impl IrcLink {
 struct IrcBackend {
     link: IrcSenderSlot,
     nick: String,
-    /// Messages held while the owner was away, oldest first.
-    pending: std::sync::Mutex<std::collections::VecDeque<(String, String)>>,
+    /// How long a message may wait for the owner before it is dropped unsent.
+    /// From `[notifications.irc] hold_seconds`.
+    hold_for: Duration,
+    /// Messages held while the owner was away, oldest first, each stamped with
+    /// the moment it was held so `hold_for` can be applied on the way out.
+    pending: std::sync::Mutex<std::collections::VecDeque<(tokio::time::Instant, String, String)>>,
 }
 
 /// How many messages to hold for an absent owner before dropping the oldest.
-/// Bounded because "away" can mean a fortnight.
+///
+/// A count bound alone was not enough: "away" can mean a fortnight, and twenty
+/// messages held for a fortnight still arrive as twenty pieces of stale news the
+/// moment the owner reconnects. `hold_for` bounds their age, this bounds how
+/// many can accumulate inside that window.
 const IRC_HOLD_LIMIT: usize = 20;
 
 #[async_trait::async_trait]
@@ -651,10 +659,15 @@ impl IrcBackend {
     }
 
     fn hold(&self, subject: &str, body: &str) {
+        // Nothing is held at all when the window is zero, rather than being held
+        // and discarded a moment later at the far end.
+        if self.hold_for.is_zero() {
+            return;
+        }
         let Ok(mut queue) = self.pending.lock() else {
             return;
         };
-        queue.push_back((subject.to_string(), body.to_string()));
+        queue.push_back((tokio::time::Instant::now(), subject.to_string(), body.to_string()));
         // Drop the oldest rather than the newest: recent news is the useful
         // news, and the drop is reported when the queue is flushed.
         while queue.len() > IRC_HOLD_LIMIT {
@@ -663,13 +676,37 @@ impl IrcBackend {
     }
 
     fn flush_held(&self, sender: &crate::irc_processor::irc::Outbound) {
-        let held: Vec<(String, String)> = match self.pending.lock() {
+        let held: Vec<(tokio::time::Instant, String, String)> = match self.pending.lock() {
             Ok(mut q) if !q.is_empty() => q.drain(..).collect(),
             _ => return,
         };
 
-        info!("{} is back; delivering {} held notification(s).", self.nick, held.len());
-        for (subject, body) in held {
+        // Age them out here rather than on the way in: what matters is how long
+        // a message waited, which is only known once someone is there to
+        // receive it. Holding exists to cross a disconnect -- a disk-low warning
+        // from last Tuesday is not news, and a queue of them arriving at once is
+        // what made this feature something to mute.
+        let total = held.len();
+        let fresh: Vec<(String, String)> = held
+            .into_iter()
+            .filter(|(at, _, _)| at.elapsed() < self.hold_for)
+            .map(|(_, subject, body)| (subject, body))
+            .collect();
+
+        let stale = total - fresh.len();
+        if stale > 0 {
+            warn!(
+                "Dropped {stale} notification(s) that waited more than {}s for {}.",
+                self.hold_for.as_secs(),
+                self.nick
+            );
+        }
+        if fresh.is_empty() {
+            return;
+        }
+
+        info!("{} is back; delivering {} held notification(s).", self.nick, fresh.len());
+        for (subject, body) in fresh {
             if let Err(e) = self.write(sender, &subject, &body) {
                 error!("Could not deliver a held notification: {e}");
                 return;
@@ -1094,6 +1131,7 @@ fn build_section_targets(
                         backend: Box::new(IrcBackend {
                             link: link.clone(),
                             nick: nick.clone(),
+                            hold_for: Duration::from_secs(irc_opts.hold_seconds),
                             pending: Default::default(),
                         }),
                         filter: irc_opts.events.clone(),
@@ -1553,6 +1591,93 @@ mod test {
             d.targets[0].outbox[0].subject, "subject 3",
             "the three oldest should have been dropped"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Holding for an absent owner
+    //
+    // A PRIVMSG to a nick that is not on the network is discarded by the server
+    // without an error, so messages wait for the owner to come back. They used
+    // to wait indefinitely: an owner returning after a weekend was handed a
+    // weekend of alerts at once, all of them describing situations that had
+    // resolved long before. Bounding the count was not enough -- twenty stale
+    // messages are still twenty stale messages.
+    // -----------------------------------------------------------------------
+
+    fn offline_irc_backend(hold_for: Duration) -> IrcBackend {
+        IrcBackend {
+            // No sender: every delivery is held, which is the case under test.
+            link: IrcSenderSlot::default(),
+            nick: "owner".into(),
+            hold_for,
+            pending: Default::default(),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_held_notification_is_dropped_once_it_is_too_old_to_be_news() {
+        let backend = offline_irc_backend(Duration::from_secs(900));
+
+        assert!(backend.deliver("disk is low", "body").await.is_err(), "nobody to send to");
+        assert_eq!(backend.pending.lock().unwrap().len(), 1, "so it is held");
+
+        tokio::time::advance(Duration::from_secs(901)).await;
+
+        let (outbound, mut rx) = crate::irc_processor::irc::Outbound::for_test();
+        backend.flush_held(&outbound);
+
+        assert!(backend.pending.lock().unwrap().is_empty(), "the stale message is gone");
+        assert!(rx.try_recv().is_err(), "and was not delivered");
+    }
+
+    /// The point of holding in the first place: a short disconnect must still be
+    /// crossed, or the feature does nothing at all.
+    #[tokio::test(start_paused = true)]
+    async fn a_held_notification_still_arrives_after_a_short_absence() {
+        let backend = offline_irc_backend(Duration::from_secs(900));
+
+        assert!(backend.deliver("disk is low", "body").await.is_err());
+        tokio::time::advance(Duration::from_secs(60)).await;
+
+        let (outbound, mut rx) = crate::irc_processor::irc::Outbound::for_test();
+        backend.flush_held(&outbound);
+
+        assert!(backend.pending.lock().unwrap().is_empty());
+        let sent = rx.try_recv().expect("a minute old is still news");
+        assert_eq!(sent.text(), "disk is low");
+    }
+
+    /// Fresh and stale in the same queue: only the stale ones go.
+    #[tokio::test(start_paused = true)]
+    async fn only_the_stale_part_of_the_backlog_is_dropped() {
+        let backend = offline_irc_backend(Duration::from_secs(900));
+
+        for i in 0..2 {
+            assert!(backend.deliver(&format!("old {i}"), "body").await.is_err());
+        }
+        tokio::time::advance(Duration::from_secs(901)).await;
+        for i in 0..2 {
+            assert!(backend.deliver(&format!("new {i}"), "body").await.is_err());
+        }
+
+        let (outbound, mut rx) = crate::irc_processor::irc::Outbound::for_test();
+        backend.flush_held(&outbound);
+
+        let delivered: Vec<String> =
+            std::iter::from_fn(|| rx.try_recv().ok()).map(|m| m.text().to_string()).collect();
+        // One PRIVMSG per line, so each surviving notification appears as its
+        // subject followed by its body. The stale pair contributes neither.
+        assert_eq!(delivered, vec!["new 0", "body", "new 1", "body"]);
+    }
+
+    /// `hold_seconds = 0` is "do not hold": nothing is queued, rather than
+    /// queued and thrown away at the far end.
+    #[tokio::test(start_paused = true)]
+    async fn a_zero_window_holds_nothing_at_all() {
+        let backend = offline_irc_backend(Duration::ZERO);
+
+        assert!(backend.deliver("disk is low", "body").await.is_err());
+        assert!(backend.pending.lock().unwrap().is_empty());
     }
 
     // -----------------------------------------------------------------------

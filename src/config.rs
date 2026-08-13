@@ -431,10 +431,39 @@ pub mod config {
         pub on_start: Option<bool>,
     }
 
-    #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    #[serde(default)]
     pub struct IrcNotifyOptions {
-        #[serde(default)]
+        /// How long a notification may wait for an absent owner before it is
+        /// dropped unsent.
+        ///
+        /// A PRIVMSG to a nick that is not on the network is discarded by the
+        /// server with no error the bot can act on, so messages are held until
+        /// the owner reappears. That is meant to cover a *disconnect*, not an
+        /// absence: unbounded, coming back after a weekend delivered a weekend
+        /// of alerts at once, every one of them describing a situation that had
+        /// long since resolved.
+        ///
+        /// `0` holds nothing -- a notification that cannot be sent now is
+        /// dropped now. Held messages do not survive a restart at any setting.
+        ///
+        /// Must stay before `events`: TOML cannot have a bare key after a table
+        /// header, and these are written out in declaration order.
+        pub hold_seconds: u64,
         pub events: EventFilter,
+    }
+
+    fn default_irc_hold_seconds() -> u64 {
+        900
+    }
+
+    impl Default for IrcNotifyOptions {
+        fn default() -> Self {
+            Self {
+                hold_seconds: default_irc_hold_seconds(),
+                events: EventFilter::default(),
+            }
+        }
     }
 
     impl Default for NotificationOptions {

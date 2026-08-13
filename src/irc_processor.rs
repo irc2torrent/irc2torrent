@@ -38,6 +38,32 @@ pub mod irc {
     /// How long to wait for a WHOIS reply before refusing the command it guards.
     /// Failing closed: an unanswered check is not permission.
     const WHOIS_TIMEOUT: Duration = Duration::from_secs(15);
+    /// How often expired identity checks are swept.
+    ///
+    /// Its own ticker rather than `PRESENCE_INTERVAL`'s: expiry used to ride the
+    /// 60s presence tick, so a 15s timeout was really anywhere from 15s to 75s
+    /// and the refusal arrived long after the sender had given up.
+    const AUTH_SWEEP_INTERVAL: Duration = Duration::from_secs(5);
+    /// Consecutive failed identity checks before a nick stops being asked about.
+    const WHOIS_FAILURE_LIMIT: u8 = 3;
+    /// How long a nick that keeps failing is left alone.
+    ///
+    /// Long enough to defeat a loop, short enough that an owner who simply
+    /// forgot to identify to NickServ is not locked out for the afternoon.
+    const WHOIS_COOLDOWN: Duration = Duration::from_secs(600);
+    /// Ceiling on identity checks per minute, whatever the nick.
+    ///
+    /// The per-nick gate and cooldown already bound this to whoever holds the
+    /// owner's nick; this is the backstop that holds when both are somehow
+    /// wrong, so the bot cannot be turned into a WHOIS amplifier at all.
+    const WHOIS_PER_MINUTE: u32 = 10;
+    /// Commands one nick may have queued behind a single identity check.
+    ///
+    /// Was unbounded, and each queued command drew its own refusal -- so a
+    /// stranger sending `h!` a thousand times had the bot queue a thousand
+    /// replies and spend half an hour draining them at the flood limit. The
+    /// bot was the thing being flooded, and it needed no WHOIS to do it.
+    const PENDING_COMMAND_LIMIT: usize = 5;
     /// `330 <me> <nick> <account> :is logged in as`. Not in irc-proto's Response
     /// enum, so it arrives as a raw numeric.
     const RPL_WHOISACCOUNT: &str = "330";
@@ -57,9 +83,95 @@ pub mod irc {
         /// reply address here makes every queued command look like a channel
         /// message and fail authorization after passing the identity check.
         commands: Vec<(String, String)>,
+        /// How many were turned away because `commands` was full. Reported once,
+        /// with the single reply, rather than one message per dropped command.
+        dropped: usize,
         /// Account name from a 330, if the network sent one.
         account: Option<String>,
         deadline: Instant,
+    }
+
+    /// How a nick has been faring at the identity check.
+    ///
+    /// Only failures are remembered. A *successful* check is deliberately not
+    /// cached: the whole reason `require_identified` exists is that a nick can
+    /// be taken the moment its owner drops off, and holding "this nick is the
+    /// owner" for any length of time reopens exactly that window. Refusing
+    /// someone who was just refused is fail-closed; trusting someone who was
+    /// trusted a while ago is not.
+    #[derive(Default)]
+    struct WhoisCooldown {
+        /// Consecutive failures. Reset by a check that succeeds.
+        failures: u8,
+        /// When lookups for this nick may resume.
+        until: Option<Instant>,
+    }
+
+    /// Per-nick record of failed identity checks.
+    ///
+    /// Takes `now` rather than reading the clock, so the cooldown can be tested
+    /// without a test that sleeps for ten minutes.
+    #[derive(Default)]
+    struct WhoisCooldowns(HashMap<String, WhoisCooldown>);
+
+    impl WhoisCooldowns {
+        /// Whether this nick is currently being left alone.
+        fn is_cooling(&self, nick: &str, now: Instant) -> bool {
+            self.0
+                .get(&nick.to_ascii_lowercase())
+                .and_then(|c| c.until)
+                .is_some_and(|until| until > now)
+        }
+
+        /// Record a failure. True when this is the one that starts a cooldown,
+        /// which is the only time the sender is told about it.
+        fn note_failure(&mut self, nick: &str, now: Instant) -> bool {
+            let entry = self.0.entry(nick.to_ascii_lowercase()).or_default();
+            entry.failures = entry.failures.saturating_add(1);
+            if entry.failures < WHOIS_FAILURE_LIMIT {
+                return false;
+            }
+            // Counted back down, so a nick that keeps trying after the cooldown
+            // expires earns another one rather than being locked out forever.
+            entry.failures = 0;
+            entry.until = Some(now + WHOIS_COOLDOWN);
+            true
+        }
+
+        /// Forget a nick's failures after a check it passed.
+        fn note_success(&mut self, nick: &str) {
+            self.0.remove(&nick.to_ascii_lowercase());
+        }
+
+        /// Drop entries that are neither cooling nor part-way to a cooldown.
+        fn prune(&mut self, now: Instant) {
+            self.0.retain(|_, c| c.failures > 0 || c.until.is_some_and(|u| u > now));
+        }
+    }
+
+    /// Token bucket over a rolling minute, shared by every nick.
+    struct WhoisBudget {
+        window_started: Instant,
+        used: u32,
+    }
+
+    impl WhoisBudget {
+        fn new(now: Instant) -> Self {
+            Self { window_started: now, used: 0 }
+        }
+
+        /// Spend one, or report that this minute is used up.
+        fn take(&mut self, now: Instant) -> bool {
+            if now.duration_since(self.window_started) >= Duration::from_secs(60) {
+                self.window_started = now;
+                self.used = 0;
+            }
+            if self.used >= WHOIS_PER_MINUTE {
+                return false;
+            }
+            self.used += 1;
+            true
+        }
     }
 
     /// Strip anything that could end the IRC line early.
@@ -309,6 +421,10 @@ pub mod irc {
         sender_slot: crate::notify::IrcSenderSlot,
         /// Commands waiting on a WHOIS, keyed by lowercased sender nick.
         pending_auth: HashMap<String, PendingAuth>,
+        /// Failed identity checks per nick, and when to resume asking.
+        whois_cooldown: WhoisCooldowns,
+        /// Global ceiling on identity checks, whatever the nick.
+        whois_budget: WhoisBudget,
         /// Paced outbound queue for the current connection, replaced on each
         /// reconnect along with the sender it wraps.
         outbound: Option<Outbound>,
@@ -344,6 +460,8 @@ pub mod irc {
                 notifier,
                 sender_slot,
                 pending_auth: HashMap::new(),
+                whois_cooldown: WhoisCooldowns::default(),
+                whois_budget: WhoisBudget::new(Instant::now()),
                 outbound: None,
             }
         }
@@ -379,6 +497,12 @@ pub mod irc {
                     // for long, or the client stops answering server PINGs.
                     let mut ticker = tokio::time::interval(PRESENCE_INTERVAL);
                     ticker.tick().await;
+                    // Expiry gets its own, much shorter tick. Riding the presence
+                    // interval meant a 15s timeout fired anywhere between 15s and
+                    // 75s after the WHOIS, so the refusal reached the sender long
+                    // after they had concluded the bot was ignoring them.
+                    let mut sweep = tokio::time::interval(AUTH_SWEEP_INTERVAL);
+                    sweep.tick().await;
 
                     loop {
                         tokio::select! {
@@ -401,6 +525,8 @@ pub mod irc {
                             },
                             _ = ticker.tick() => {
                                 self.probe_owner_presence();
+                            }
+                            _ = sweep.tick() => {
                                 self.expire_pending_auth();
                             }
                         }
@@ -486,17 +612,23 @@ pub mod irc {
             for nick in expired {
                 if let Some(p) = self.pending_auth.remove(&nick) {
                     warn!("No WHOIS reply for {nick}; refusing {} command(s).", p.commands.len());
-                    for (target, _) in p.commands {
-                        let to = self.reply_to(&target, &nick).to_string();
-                        self.send_privmsg(
-                            &to,
-                            "Could not verify your identity with the network in time; \
-                             command refused. If your network has no services, set \
-                             command_options.require_identified = false.",
-                        );
-                    }
+                    // An unanswered check is a failed one for cooldown purposes:
+                    // a network that does not answer will not answer the next
+                    // one either, and this is exactly the shape a flood takes.
+                    self.refuse_pending(
+                        &nick,
+                        &p,
+                        "Could not verify your identity with the network in time; command \
+                         refused. If your network has no services, set \
+                         command_options.require_identified = false."
+                            .to_string(),
+                    );
                 }
             }
+
+            // Cooldowns that have run their course, so the map does not keep an
+            // entry per nick that ever failed.
+            self.whois_cooldown.prune(now);
         }
 
         /// Abandon everything queued on a connection that has gone away.
@@ -521,9 +653,16 @@ pub mod irc {
                 crate::config::config::SecurityMode::Password(_) => return,
             };
 
-            match &pending.account {
+            // Lifted out of `pending` before the match so the arms are free to
+            // consume it: one of them moves the queued commands, the others
+            // hand the whole thing to `refuse_pending`.
+            let account = pending.account.clone();
+
+            match account.as_deref() {
                 Some(account) if account.eq_ignore_ascii_case(&expected) => {
                     info!("{nick} is identified as {account}; running queued command(s).");
+                    // Only failures are remembered, and this was not one.
+                    self.note_whois_success(nick);
                     for (target, message) in pending.commands {
                         self.run_command(&target, &message, nick).await;
                     }
@@ -535,22 +674,48 @@ pub mod irc {
                          '{expected}'. Set command_options.security_mode to your services \
                          account name."
                     );
-                    for (target, _) in pending.commands {
-                        let to = self.reply_to(&target, nick).to_string();
-                        self.send_privmsg(&to, &reason);
-                    }
+                    self.refuse_pending(nick, &pending, reason);
                 }
                 None => {
                     error!("{nick} is not identified to services; refusing command(s).");
-                    for (target, _) in pending.commands {
-                        let to = self.reply_to(&target, nick).to_string();
-                        self.send_privmsg(
-                            &to,
-                            "You are not identified to network services. Identify with \
-                             NickServ and try again.",
-                        );
-                    }
+                    self.refuse_pending(
+                        nick,
+                        &pending,
+                        "You are not identified to network services. Identify with NickServ \
+                         and try again."
+                            .to_string(),
+                    );
                 }
+            }
+        }
+
+        /// Answer a batch of refused commands with a single message.
+        ///
+        /// One, not one each. A reply per queued entry is how a stranger got the
+        /// bot to send a message for every message they sent it -- and with the
+        /// queue previously unbounded, to spend half an hour draining them at
+        /// the flood limit while everything else waited behind.
+        fn refuse_pending(&mut self, nick: &str, pending: &PendingAuth, reason: String) {
+            // Answer where the first command came from; the rest were queued
+            // behind it and share its outcome.
+            let Some((target, _)) = pending.commands.first() else {
+                return;
+            };
+            let to = self.reply_to(target, nick).to_string();
+
+            let mut reason = reason;
+            if pending.dropped > 0 {
+                reason.push_str(&format!(
+                    " ({} further command(s) went unread.)",
+                    pending.dropped
+                ));
+            }
+            self.send_privmsg(&to, &reason);
+
+            // Sent once, when the cooldown starts. Afterwards the nick is
+            // ignored in silence.
+            if let Some(notice) = self.note_whois_failure(nick) {
+                self.send_privmsg(&to, &notice);
             }
         }
 
@@ -661,6 +826,31 @@ pub mod irc {
         }
 
         async fn command_msg_process(&mut self, target: &str, inner_message: &str, sender: &str) {
+            let direct = target.eq_ignore_ascii_case(&self.our_nick);
+
+            // Settle what this message could possibly achieve before spending
+            // anything on it. Routing here is purely syntactic -- `is_command`
+            // matches `cmd:` and the short forms and nothing else -- so without
+            // this, a stranger typing `h!` in the announce channel bought a
+            // WHOIS and a reply naming the owner's account.
+            match self.auth.gate_irc_command(sender, direct) {
+                crate::auth::CommandGate::Proceed => {}
+                crate::auth::CommandGate::Refuse(why) => {
+                    info!("Command from {sender} refused: {why}");
+                    let to = self.reply_to(target, sender).to_string();
+                    self.send_privmsg(&to, why);
+                    return;
+                }
+                crate::auth::CommandGate::Ignore => {
+                    info!(
+                        "Ignoring a command-shaped message from {sender} on {target}: it could \
+                         not be authorized however it resolved, so it costs neither an identity \
+                         check nor a reply."
+                    );
+                    return;
+                }
+            }
+
             info!("Message is a command from {sender}.");
 
             // Verify identity with the network before running anything, if asked
@@ -679,17 +869,47 @@ pub mod irc {
 
             if gated {
                 let key = sender.to_ascii_lowercase();
+
+                // A nick that has failed the check repeatedly is not asked about
+                // again for a while. Silent by design: the message saying so was
+                // already sent when the cooldown began, and repeating it per
+                // attempt would restore the amplifier this is here to remove.
+                let now = Instant::now();
+                if self.whois_cooldown.is_cooling(sender, now) {
+                    info!(
+                        "{sender} failed the identity check {WHOIS_FAILURE_LIMIT} times; \
+                         ignoring commands from that nick until the cooldown expires."
+                    );
+                    return;
+                }
+
+                // A second command arriving before the first resolves rides the
+                // WHOIS already in flight rather than starting another, and so
+                // is not charged to the budget either.
+                let in_flight = self.pending_auth.contains_key(&key);
+                if !in_flight && !self.whois_budget.take(now) {
+                    warn!("WHOIS budget for this minute is spent; refusing {sender}'s command.");
+                    let to = self.reply_to(target, sender).to_string();
+                    self.send_privmsg(&to, "Too many identity checks just now; try again shortly.");
+                    return;
+                }
+
                 let entry = self.pending_auth.entry(key).or_insert_with(|| PendingAuth {
                     commands: Vec::new(),
+                    dropped: 0,
                     account: None,
                     deadline: Instant::now() + WHOIS_TIMEOUT,
                 });
-                let first = entry.commands.is_empty();
-                entry.commands.push((target.to_string(), inner_message.to_string()));
 
-                // A second command arriving before the first resolves rides the
-                // WHOIS already in flight rather than starting another.
-                if first {
+                // Keep the first few and count the rest. The earliest commands
+                // are the ones that were meant; a flood behind them is not.
+                if entry.commands.len() < PENDING_COMMAND_LIMIT {
+                    entry.commands.push((target.to_string(), inner_message.to_string()));
+                } else {
+                    entry.dropped = entry.dropped.saturating_add(1);
+                }
+
+                if !in_flight {
                     if let Some(c) = self.client.borrow_mut().as_mut() {
                         if let Err(e) = c.send(Command::WHOIS(None, sender.to_string())) {
                             error!("Could not send WHOIS for {sender}: {e:?}");
@@ -700,6 +920,35 @@ pub mod irc {
             }
 
             self.run_command(target, inner_message, sender).await;
+        }
+
+        /// Record a failed identity check, and start a cooldown once a nick has
+        /// managed enough of them.
+        ///
+        /// Returns the message to send, if this failure is the one that begins
+        /// the cooldown -- so the sender is told once, at the point it starts,
+        /// and not on every attempt afterwards.
+        fn note_whois_failure(&mut self, nick: &str) -> Option<String> {
+            if !self.whois_cooldown.note_failure(nick, Instant::now()) {
+                return None;
+            }
+
+            warn!(
+                "{nick} has failed the identity check {WHOIS_FAILURE_LIMIT} times; ignoring \
+                 commands from that nick for {}s.",
+                WHOIS_COOLDOWN.as_secs()
+            );
+            Some(format!(
+                "That is {WHOIS_FAILURE_LIMIT} failed identity checks, so I will ignore commands \
+                 from this nick for {} minutes. If your network has no services, set \
+                 command_options.require_identified = false.",
+                WHOIS_COOLDOWN.as_secs() / 60
+            ))
+        }
+
+        /// Forget a nick's failures after a check it passed.
+        fn note_whois_success(&mut self, nick: &str) {
+            self.whois_cooldown.note_success(nick);
         }
 
         /// Execute a command that has cleared the identity check, if one applied.
@@ -849,6 +1098,133 @@ pub mod irc {
                     None
                 }
             }
+        }
+    }
+
+    /// The two bounds on the identity check, tested against a clock they are
+    /// handed rather than one they read -- a ten-minute cooldown is not
+    /// something to verify by waiting.
+    #[cfg(test)]
+    mod whois_limits_test {
+        use super::*;
+
+        #[test]
+        fn the_budget_allows_a_bounded_number_of_lookups_per_minute() {
+            let start = Instant::now();
+            let mut budget = WhoisBudget::new(start);
+
+            for i in 0..WHOIS_PER_MINUTE {
+                assert!(budget.take(start), "lookup {i} is within the budget");
+            }
+            assert!(!budget.take(start), "the budget must run out");
+        }
+
+        #[test]
+        fn the_budget_refills_on_the_next_minute() {
+            let start = Instant::now();
+            let mut budget = WhoisBudget::new(start);
+            for _ in 0..WHOIS_PER_MINUTE {
+                budget.take(start);
+            }
+            assert!(!budget.take(start));
+
+            // Just short of a minute is still the same window.
+            assert!(!budget.take(start + Duration::from_secs(59)));
+            assert!(budget.take(start + Duration::from_secs(60)));
+        }
+
+        #[test]
+        fn a_nick_is_left_alone_after_repeated_failures() {
+            let now = Instant::now();
+            let mut cooldowns = WhoisCooldowns::default();
+
+            for i in 1..WHOIS_FAILURE_LIMIT {
+                assert!(
+                    !cooldowns.note_failure("owner", now),
+                    "failure {i} is below the limit, so nothing is said"
+                );
+                assert!(!cooldowns.is_cooling("owner", now));
+            }
+
+            assert!(
+                cooldowns.note_failure("owner", now),
+                "the last failure starts the cooldown, and says so once"
+            );
+            assert!(cooldowns.is_cooling("owner", now));
+        }
+
+        /// The message is sent when the cooldown begins and never again, or the
+        /// bot answers every attempt and is an amplifier once more.
+        #[test]
+        fn the_cooldown_announces_itself_exactly_once() {
+            let now = Instant::now();
+            let mut cooldowns = WhoisCooldowns::default();
+            let mut announced = 0;
+
+            for _ in 0..(WHOIS_FAILURE_LIMIT as u32 * 3) {
+                if cooldowns.note_failure("owner", now) {
+                    announced += 1;
+                }
+            }
+            assert_eq!(announced, 3, "one per completed run of failures, not one per failure");
+        }
+
+        #[test]
+        fn a_check_that_passes_clears_the_failures() {
+            let now = Instant::now();
+            let mut cooldowns = WhoisCooldowns::default();
+
+            cooldowns.note_failure("owner", now);
+            cooldowns.note_success("owner");
+
+            // Back to zero: the next failure must not be the one that trips it.
+            for _ in 1..WHOIS_FAILURE_LIMIT {
+                assert!(!cooldowns.note_failure("owner", now));
+            }
+            assert!(cooldowns.note_failure("owner", now));
+        }
+
+        #[test]
+        fn the_cooldown_expires_and_is_pruned() {
+            let now = Instant::now();
+            let mut cooldowns = WhoisCooldowns::default();
+            for _ in 0..WHOIS_FAILURE_LIMIT {
+                cooldowns.note_failure("owner", now);
+            }
+            assert!(cooldowns.is_cooling("owner", now));
+
+            let later = now + WHOIS_COOLDOWN + Duration::from_secs(1);
+            assert!(!cooldowns.is_cooling("owner", later), "the cooldown must end");
+
+            cooldowns.prune(later);
+            assert!(cooldowns.0.is_empty(), "an expired entry must not be kept forever");
+        }
+
+        /// A nick part-way to a cooldown is not pruned, or the counter resets
+        /// every sweep and the limit is never reached.
+        #[test]
+        fn pruning_keeps_a_nick_that_is_part_way_there() {
+            let now = Instant::now();
+            let mut cooldowns = WhoisCooldowns::default();
+            cooldowns.note_failure("owner", now);
+
+            cooldowns.prune(now);
+            assert_eq!(cooldowns.0.len(), 1);
+        }
+
+        #[test]
+        fn cooldowns_are_case_insensitive_like_every_other_nick_comparison() {
+            let now = Instant::now();
+            let mut cooldowns = WhoisCooldowns::default();
+
+            for _ in 0..WHOIS_FAILURE_LIMIT {
+                cooldowns.note_failure("Owner", now);
+            }
+            assert!(cooldowns.is_cooling("owner", now));
+            assert!(cooldowns.is_cooling("OWNER", now));
+
+            cooldowns.note_success("oWnEr");
+            assert!(!cooldowns.is_cooling("Owner", now));
         }
     }
 }

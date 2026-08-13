@@ -619,6 +619,17 @@ The bot checks whether you are actually online (`ISON`, once a minute). A PRIVMS
 nick is discarded by the server with no error it can act on, so messages sent while you are away
 are **held and delivered when you reappear** — up to 20, oldest dropped first.
 
+Holding is for crossing a *disconnect*, not an absence, so held messages also expire:
+**`hold_seconds` (default 900)** drops anything that waited longer than fifteen minutes, and the
+log says how many went. Without that bound, coming back after a weekend delivered a weekend of
+alerts at once, each describing something that had resolved long before you read it. Raise it to
+cover a lunch break, or set it to `0` to hold nothing at all.
+
+```toml
+[notifications.irc]
+hold_seconds = 900
+```
+
 Still best-effort: held messages are lost if the bot restarts, and nothing can be sent while the
 bot itself is disconnected — which is exactly when `on_failure` matters most. Don't make this your
 only backend.
@@ -702,9 +713,22 @@ commands_enabled  = true
 require_identified = true     # default
 ```
 
-Each command costs one WHOIS round trip. Set `IrcUserName` to your **services account name**,
-which is usually your nick but not always. If the network never answers, the command is refused
-after 15 seconds — an unanswered identity check is not permission.
+**Only your own commands cost a WHOIS.** A command-shaped message that could not be authorized
+however it resolved — from any nick but the configured one, from anywhere but a private message,
+or any message at all while `commands_enabled` is false — is dropped without a lookup and without
+a reply. So a stranger typing `h!` in the announce channel costs nothing, learns nothing, and
+cannot use the bot to make the server answer questions on their behalf.
+
+Behind that, two bounds apply to what is left: a nick that fails the check three times running is
+ignored for ten minutes (told once, when the cooldown starts), and lookups are capped at ten per
+minute regardless of nick.
+
+Set `IrcUserName` to your **services account name** — and note that it is matched twice, against
+the nick sending the command *and* against the account services report. If your nick and your
+account name differ, no command is accepted; use the account name for both.
+
+If the network never answers, the command is refused after 15 seconds — an unanswered identity
+check is not permission.
 
 Set `require_identified = false` only if your network has no services. Without it, the guarantee
 falls back to "whoever holds this nick", so make sure the network enforces nick registration and
