@@ -302,3 +302,42 @@ jobs:
           docker cp qbtfiles:/usr/lib/qt6/plugins/tls/libqopensslbackend.so /tmp/tls.so
           test -s /tmp/tls.so
           docker rm qbtfiles >/dev/null
+
+      # -----------------------------------------------------------------------
+      # A release must not ship a critical or high CVE.
+      #
+      # 0.16.0 through 0.17.1 shipped a CVSS 10.0 in a Go standard library --
+      # in an image that contains no Go. Flood's build tree was being copied
+      # into the runtime, and two of its 131 devDependencies are esbuild, which
+      # is written in Go. Nothing in this repo was vulnerable; the runtime just
+      # carried a compiler it never ran, and the only place that was visible was
+      # a scan of the built artifact. So it gates the release rather than being
+      # advisory -- three releases went out before anyone looked.
+      #
+      # Runs after the verification steps above: a broken image should fail on
+      # being broken, not on its CVE count.
+      #
+      # If an unfixable CVE ever blocks a release, add `only-fixed: true` here
+      # rather than deleting the gate.
+      # -----------------------------------------------------------------------
+      - name: Block the release on a critical or high CVE (rTorrent image)
+        if: github.event_name == 'push'
+        uses: docker/scout-action@v1
+        with:
+          command: cves
+          image: ${{ env.IMAGE }}:${{ steps.vars.outputs.tag }}
+          only-severities: critical,high
+          exit-code: true
+          dockerhub-user: ${{ secrets.DOCKERHUB_USERNAME }}
+          dockerhub-password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Block the release on a critical or high CVE (qBittorrent image)
+        if: github.event_name == 'push'
+        uses: docker/scout-action@v1
+        with:
+          command: cves
+          image: ${{ env.QBT_IMAGE }}:${{ steps.vars.outputs.tag }}
+          only-severities: critical,high
+          exit-code: true
+          dockerhub-user: ${{ secrets.DOCKERHUB_USERNAME }}
+          dockerhub-password: ${{ secrets.DOCKERHUB_TOKEN }}
