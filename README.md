@@ -755,7 +755,7 @@ Found something? See [SECURITY.md](SECURITY.md) for how to report it privately.
 ```sh
 ./docker/build.sh                    # -> flood_rtorrent_irc2torrent:dev
 TARGET=qbt-runtime ./docker/build.sh # -> flood_qbittorrent_irc2torrent:dev
-TAG=0.17.1 ./docker/build.sh
+TAG=0.17.2 ./docker/build.sh
 TARGET=debug ./docker/build.sh       # DHI -dev base, keeps sh + apk for troubleshooting
 ```
 
