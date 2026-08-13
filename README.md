@@ -258,11 +258,18 @@ to it, and restarts children with capped backoff.
 
 Off unless `IRC2TORRENT_SYSLOG` is set. When it is, everything irc2torrent logs goes to the
 collector as well as to `docker logs` — no shipper, no sidecar, no file to tail. Lines are
-RFC 3164, which is what QNAP's QuLog Center, rsyslog, syslog-ng and Synology all accept.
+RFC 3164, which rsyslog, syslog-ng, Grafana Alloy and Synology all accept.
 
 ```sh
-docker run -e IRC2TORRENT_SYSLOG=udp://192.168.1.10:514 …    # QuLog Center on a QNAP NAS
+docker run -e IRC2TORRENT_SYSLOG=udp://192.168.1.10:514 …
 ```
+
+> **Not QNAP's QuLog Center.** Its "Log Receiver" is not a syslog server despite the name — it
+> speaks a QNAP-proprietary protocol and only accepts logs from another QNAP NAS running QuLog.
+> Nothing sent from here will ever appear there, in any format, over any transport. Use QNAP's
+> older **Control Panel → Applications → Syslog Server**, which does take RFC 3164, or a real
+> collector. [`docs/loki-stack.compose.yml`](docs/loki-stack.compose.yml) is a ready-to-run
+> Loki + Grafana + Prometheus stack that ingests this and keeps 30 days instead of QNAP's 100 MB.
 
 | Variable | Default | Purpose |
 |---|---|---|

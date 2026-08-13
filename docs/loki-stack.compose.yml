@@ -1,0 +1,414 @@
+# Loki + Alloy + Grafana + Prometheus, in one file.
+#
+#   * Logs     -- syslog on 5514 -> Loki -> Grafana
+#   * Vitals   -- cAdvisor (built into Alloy) -> Prometheus -> Grafana
+#
+# Configs are inlined in the `configs:` block at the bottom, so this file is the
+# only thing to upload or edit. Data lives in real NAS folders rather than
+# Docker-managed volumes, so it is visible in File Station, survives a stack
+# teardown, and is picked up by whatever backs up that share.
+#
+# ---------------------------------------------------------------------------
+# BEFORE FIRST START, on the NAS over SSH:
+#
+#   STACK=/share/Container/logstack
+#   mkdir -p $STACK/data/{loki,grafana,prometheus,alloy}
+#   chown -R 10001:10001 $STACK/data/loki         # loki    runs as uid 10001
+#   chown -R 472:472     $STACK/data/grafana      # grafana runs as uid 472
+#   chown -R 65534:65534 $STACK/data/prometheus   # prom    runs as nobody
+#
+# If chown does not stick (some QNAP shares ignore it), uncomment the
+# `user: "0:0"` lines instead -- see the note on each service.
+#
+# Paths are hardcoded rather than using ${STACK_DIR:-...} interpolation. That
+# syntax is valid Compose, but Container Station's UI may not expand it -- and
+# when it does not, Docker creates a directory literally named "${STACK_DIR:-..}"
+# and your data silently goes there. Search/replace /share/Container/logstack
+# if yours differs.
+#
+# Resource limits are set in the Container Station UI, not here -- the
+# Application tab rejects `deploy:` blocks.
+# ---------------------------------------------------------------------------
+
+services:
+
+  loki:
+    image: grafana/loki:latest
+    container_name: loki
+    restart: unless-stopped
+    command: -config.file=/etc/loki/loki-config.yaml
+    # user: "0:0"    # uncomment if chown 10001 did not take
+    configs:
+      - source: loki_config
+        target: /etc/loki/loki-config.yaml
+        mode: 0444
+    volumes:
+      - /share/Container/logstack/data/loki:/loki
+    networks: [logging]
+
+  alloy:
+    image: grafana/alloy:latest
+    container_name: alloy
+    restart: unless-stopped
+    command:
+      - run
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --storage.path=/var/lib/alloy/data
+      - /etc/alloy/config.alloy
+    # cAdvisor reads cgroup data, which needs privileged plus the host mounts
+    # below. This is a real privilege grant -- drop this service's cadvisor
+    # blocks and these mounts if you would rather not.
+    privileged: true
+    ports:
+      - "5514:5514/udp"
+      - "5514:5514/tcp"
+      - "12345:12345/tcp"      # Alloy's own UI: component health, live debug
+    configs:
+      - source: alloy_config
+        target: /etc/alloy/config.alloy
+        mode: 0444
+    volumes:
+      - /share/Container/logstack/data/alloy:/var/lib/alloy/data
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /:/rootfs:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+    depends_on: [loki, prometheus]
+    networks: [logging]
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      # Required. Without it Prometheus rejects Alloy's pushes and vitals
+      # silently never arrive.
+      - --web.enable-remote-write-receiver
+      - --storage.tsdb.retention.time=30d
+    # user: "0:0"    # uncomment if chown 65534 did not take
+    configs:
+      - source: prometheus_config
+        target: /etc/prometheus/prometheus.yml
+        mode: 0444
+    volumes:
+      - /share/Container/logstack/data/prometheus:/prometheus
+    networks: [logging]
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    restart: unless-stopped
+    ports:
+      - "3001:3000"
+    # user: "0:0"    # uncomment if chown 472 did not take
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: "changeme"    # change on first login
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+    configs:
+      - source: grafana_loki_datasource
+        target: /etc/grafana/provisioning/datasources/loki.yaml
+        mode: 0444
+      - source: grafana_prometheus_datasource
+        target: /etc/grafana/provisioning/datasources/prometheus.yaml
+        mode: 0444
+    volumes:
+      - /share/Container/logstack/data/grafana:/var/lib/grafana
+    depends_on: [loki, prometheus]
+    networks: [logging]
+
+networks:
+  logging:
+    # Pinned rather than left to Docker's allocator. A Docker network that
+    # overlaps a VPN's client subnet breaks routing the moment it is created,
+    # which presents as "starting the stack killed my VPN" -- QNAP's QVPN hands
+    # L2TP clients 10.2.0.0/24 by default, and Docker's allocator does not know
+    # that. Change this if it collides with anything on your own LAN.
+    ipam:
+      config:
+        - subnet: 172.29.240.0/24
+
+configs:
+
+  # ===========================================================================
+  # Loki. Indexes labels only, never message bodies -- which is why it suits a
+  # CPU-poor box. Ingest is nearly free; a wide-range query is the only real
+  # cost, and the limits below bound it.
+  # ===========================================================================
+  loki_config:
+    content: |
+      auth_enabled: false
+
+      server:
+        http_listen_port: 3100
+        grpc_listen_port: 9096
+        log_level: warn
+
+      common:
+        instance_addr: 127.0.0.1
+        path_prefix: /loki
+        replication_factor: 1
+        ring:
+          kvstore:
+            store: inmemory
+
+      schema_config:
+        configs:
+          - from: "2024-01-01"
+            store: tsdb
+            object_store: filesystem
+            schema: v13
+            index:
+              prefix: index_
+              # Must be 24h. Retention does not work with any other period.
+              period: 24h
+
+      storage_config:
+        filesystem:
+          directory: /loki/chunks
+        tsdb_shipper:
+          active_index_directory: /loki/index
+          cache_location: /loki/index_cache
+
+      compactor:
+        working_directory: /loki/retention
+        compaction_interval: 10m
+        retention_enabled: true
+        retention_delete_delay: 2h
+        retention_delete_worker_count: 20
+        delete_request_store: filesystem
+
+      limits_config:
+        # 30 days -- the thing QNAP's 100 MB cap denies you. Raise or lower
+        # freely; the only cost is disk.
+        retention_period: 720h
+        ingestion_rate_mb: 8
+        ingestion_burst_size_mb: 16
+        # Default 32. Each unit is a goroutine doing real work; 8 stops an
+        # accidental "last 30 days" search pinning every core.
+        max_query_parallelism: 8
+        volume_enabled: true
+
+      ingester:
+        # Fewer, larger flushes. Each is compression plus a write, so holding
+        # chunks longer trades RAM you have for CPU you do not.
+        chunk_idle_period: 1h
+        max_chunk_age: 2h
+        chunk_target_size: 1572864
+
+      analytics:
+        reporting_enabled: false
+
+  # ===========================================================================
+  # Alloy: syslog -> Loki, container vitals -> Prometheus.
+  # ===========================================================================
+  alloy_config:
+    content: |
+      // -----------------------------------------------------------------
+      // Syslog ingestion
+      // -----------------------------------------------------------------
+
+      loki.source.syslog "syslog" {
+        listener {
+          address                = "0.0.0.0:5514"
+          protocol               = "udp"
+          // rfc3164 is what irc2torrent 0.17.0 emits. Alloy's own default is
+          // rfc5424 -- this is the one line to change if the bot gains a
+          // 5424 mode.
+          syslog_format          = "rfc3164"
+          // Deliberately false. RFC 3164 carries no timezone and the syslog
+          // crate stamps UTC while the NAS runs UTC+3, so trusting the
+          // incoming timestamp files every line three hours in the past.
+          use_incoming_timestamp = false
+          labels                 = { job = "syslog", transport = "udp" }
+        }
+
+        listener {
+          address                = "0.0.0.0:5514"
+          protocol               = "tcp"
+          syslog_format          = "rfc3164"
+          use_incoming_timestamp = false
+          labels                 = { job = "syslog", transport = "tcp" }
+        }
+
+        // MUST be here rather than a downstream loki.relabel: the source
+        // strips every __-prefixed label before passing entries on, so a later
+        // component has nothing left to map.
+        relabel_rules = loki.relabel.syslog.rules
+        forward_to    = [loki.process.split_children.receiver]
+      }
+
+      // Every line arrives tagged irc2torrent, because CHILD_LOGS routes
+      // rTorrent and Flood output through the bot's own logger -- one process,
+      // one syslog header, one app_name. The only trace of origin is the
+      // [name] prefix that relay_output prepends, so recover it here.
+      loki.process "split_children" {
+        forward_to = [loki.write.default.receiver]
+
+        stage.static_labels {
+          values = { source = "irc2torrent" }
+        }
+
+        // `payload` is everything after the prefix -- the JSON body, for Flood.
+        //
+        // No trailing end-of-line anchor. Compose expands dollar-prefixed
+        // variables inside `configs: content:`, so a literal dollar sign either
+        // vanishes or has to be doubled. ".*" is greedy and does not cross
+        // newlines, so it reaches the end of the line anyway.
+        stage.regex {
+          expression = "^\\[(?P<child>rtorrent|qbittorrent|flood)\\] (?P<payload>.*)"
+        }
+
+        // Applies only when the regex matched, so the static value above
+        // survives for the bot's own lines.
+        stage.labels {
+          values = { source = "child" }
+        }
+
+        // Flood's stdout is pino JSON, so its real severity is recoverable --
+        // unlike rTorrent's free text. Everything from a child arrives over
+        // syslog as info, so without this a Flood error looks exactly like a
+        // request log.
+        stage.match {
+          selector = "{source=\"flood\"}"
+
+          // Parse `payload`, not the whole line: the line still carries the
+          // "[flood] " prefix, which is not valid JSON.
+          stage.json {
+            source      = "payload"
+            expressions = { flood_level = "level" }
+          }
+
+          // pino numbers -> syslog severity names, so `severity` means the same
+          // thing whatever produced the line. printf normalises the value
+          // first: stage.json yields a number, and comparing that to a string
+          // literal would never match.
+          //
+          // Written without a Go template variable on purpose. Compose expands
+          // dollar-prefixed names inside `configs: content:`, so a variable like
+          // dollar-l is replaced by the empty string before Alloy ever sees it,
+          // leaving "{{ := printf ... }}" and a parse error. Repeating the
+          // printf is uglier but contains nothing for Compose to eat.
+          stage.template {
+            source   = "severity"
+            template = "{{ if eq (printf \"%v\" .flood_level) \"60\" }}crit{{ else if eq (printf \"%v\" .flood_level) \"50\" }}err{{ else if eq (printf \"%v\" .flood_level) \"40\" }}warning{{ else if eq (printf \"%v\" .flood_level) \"20\" }}debug{{ else if eq (printf \"%v\" .flood_level) \"10\" }}debug{{ else }}informational{{ end }}"
+          }
+
+          // Empty string means "use the extracted key of the same name", i.e.
+          // the value stage.template just wrote.
+          stage.labels {
+            values = { severity = "" }
+          }
+        }
+      }
+
+      loki.relabel "syslog" {
+        forward_to = []
+
+        // __syslog_message_hostname -> hostname, and so on. Keep the set
+        // small: each distinct label value is its own Loki stream, and high
+        // cardinality is the one reliable way to make Loki slow.
+        rule {
+          action      = "labelmap"
+          regex       = "__syslog_message_(hostname|app_name|severity)"
+          replacement = "$1"
+        }
+      }
+
+      loki.write "default" {
+        endpoint {
+          url = "http://loki:3100/loki/api/v1/push"
+        }
+      }
+
+      // -----------------------------------------------------------------
+      // Container vitals: CPU, memory, network, disk -- per container
+      // -----------------------------------------------------------------
+
+      prometheus.exporter.cadvisor "containers" {
+        docker_host = "unix:///var/run/docker.sock"
+
+        // Docker containers plus root stats only. Without this it walks every
+        // cgroup on the NAS, which on QTS means many system slices you will
+        // never chart -- pure CPU for noise.
+        docker_only = true
+
+        storage_duration = "2m"
+
+        // On top of cAdvisor's defaults: the per-connection and per-NUMA
+        // collectors, which are the expensive ones and meaningless here.
+        disabled_metrics = ["tcp", "udp", "advtcp", "process", "sched", "hugetlb", "referenced_memory", "cpu_topology", "resctrl", "memory_numa"]
+
+        // QNAP containers carry many labels; promoting each to a Prometheus
+        // label multiplies series count for no benefit.
+        store_container_labels = false
+      }
+
+      prometheus.scrape "containers" {
+        targets    = prometheus.exporter.cadvisor.containers.targets
+        forward_to = [prometheus.remote_write.default.receiver]
+
+        // 60s rather than the usual 15s. This is the biggest CPU lever in the
+        // stack -- every scrape walks the cgroup tree -- and container vitals
+        // do not move meaningfully faster. 120s is fine if it is still too much.
+        scrape_interval = "60s"
+        scrape_timeout  = "30s"
+      }
+
+      prometheus.remote_write "default" {
+        endpoint {
+          url = "http://prometheus:9090/api/v1/write"
+        }
+      }
+
+  # ===========================================================================
+  # Prometheus is purely a store here -- Alloy pushes via remote_write, so
+  # there are no scrape_configs and it never reaches out to anything.
+  # ===========================================================================
+  prometheus_config:
+    content: |
+      global:
+        scrape_interval: 60s
+        evaluation_interval: 60s
+
+  # ===========================================================================
+  # Grafana datasources, provisioned so there is nothing to click.
+  # ===========================================================================
+  grafana_loki_datasource:
+    content: |
+      apiVersion: 1
+
+      datasources:
+        - name: Loki
+          type: loki
+          # No `uid:` on purpose. Pinning one here makes provisioning try to
+          # change the uid of an already-existing datasource of the same name,
+          # which fails with "data source not found" -- and Grafana treats a
+          # provisioning failure as fatal, so it will not start at all. The
+          # dashboard uses datasource variables, so it does not need a fixed uid.
+          access: proxy
+          url: http://loki:3100
+          isDefault: true
+          # true so it can be adjusted in the UI. Provisioning still re-applies
+          # this file on every restart, so fold anything worth keeping back here.
+          editable: true
+          jsonData:
+            # Grafana rendering is the main CPU cost, and it scales with lines
+            # returned.
+            maxLines: 1000
+
+  grafana_prometheus_datasource:
+    content: |
+      apiVersion: 1
+
+      datasources:
+        - name: Prometheus
+          type: prometheus
+          # No `uid:` -- see the note on the Loki datasource above.
+          access: proxy
+          url: http://prometheus:9090
+          isDefault: false
+          editable: true
