@@ -1110,6 +1110,7 @@ dependencies = [
  "dxr_client",
  "fastrand",
  "futures",
+ "hostname",
  "irc",
  "lava_torrent",
  "lettre",

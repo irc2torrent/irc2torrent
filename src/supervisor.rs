@@ -163,7 +163,18 @@ impl Service {
 /// would stop draining the pipe. Once the 64 KiB pipe buffer filled, the child
 /// would then block forever on its next write -- rTorrent silently wedging is a
 /// far worse failure than a mangled log line.
+///
+/// Lines go straight to stderr rather than through `log`, which is why they
+/// carry no timestamp of their own and why a remote syslog sink does not see
+/// them. `IRC2TORRENT_SYSLOG_CHILD_LOGS=1` routes them through `log` instead --
+/// one line still, not two, so `docker logs` gains our prefix rather than a
+/// duplicate.
 fn relay_output<R: std::io::Read + Send + 'static>(name: &'static str, reader: R) {
+    // Read once per pipe, not once per line: this is the hot path for every
+    // line rTorrent and Flood produce, and there are only ever a handful of
+    // pipes.
+    let via_log = crate::logging::child_logs_via_log();
+
     std::thread::spawn(move || {
         let mut reader = std::io::BufReader::new(reader);
         let mut buf = Vec::new();
@@ -173,7 +184,16 @@ fn relay_output<R: std::io::Read + Send + 'static>(name: &'static str, reader: R
                 Ok(0) => return, // EOF: the child exited
                 Ok(_) => {
                     let line = String::from_utf8_lossy(&buf);
-                    eprintln!("[{name}] {}", line.trim_end_matches(['\n', '\r']));
+                    let line = line.trim_end_matches(['\n', '\r']);
+                    // Everything lands at info: rTorrent and Flood have their
+                    // own severity conventions and neither is machine-readable
+                    // enough to map reliably. Guessing wrong would hide a real
+                    // error behind a level filter.
+                    if via_log {
+                        info!("[{name}] {line}");
+                    } else {
+                        eprintln!("[{name}] {line}");
+                    }
                 }
                 Err(_) => return,
             }

@@ -2,7 +2,6 @@
 extern crate log;
 extern crate pub_sub;
 extern crate simplelog;
-extern crate syslog;
 
 use log::LevelFilter;
 use simplelog::*;
@@ -24,15 +23,36 @@ fn supervise_requested() -> bool {
 // what the rest of the crate uses.
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
-    CombinedLogger::init(vec![
+    let mut sinks: Vec<Box<dyn SharedLogger>> = vec![
         #[cfg(all(feature = "termcolor", not(debug_assertions)))]
             TermLogger::new(LevelFilter::Info, Config::default(), TerminalMode::Mixed, ColorChoice::Auto),
         #[cfg(all(not(feature = "termcolor"), not(debug_assertions)))]
             SimpleLogger::new(LevelFilter::Info, Config::default()),
         #[cfg(debug_assertions)]
             TestLogger::new(LevelFilter::Info, Default::default()),
-    ]).unwrap();
+    ];
+
+    // The remote sink has to be built before the logger exists, so a bad target
+    // has nowhere to report itself to yet. Hold the error and log it below --
+    // never fail startup over it: losing the bot because a NAS moved would be a
+    // far worse outcome than losing its logs.
+    let syslog_error = match irc2torrent::logging::sink() {
+        Ok(Some(sink)) => {
+            sinks.push(sink);
+            None
+        }
+        Ok(None) => None,
+        Err(e) => Some(e),
+    };
+
+    CombinedLogger::init(sinks).unwrap();
     info!("Started the app");
+
+    match (&syslog_error, irc2torrent::logging::describe()) {
+        (Some(e), _) => warn!("{e}; continuing without remote syslog."),
+        (None, Some(target)) => info!("Remote syslog enabled: {target}"),
+        (None, None) => {}
+    }
 
     // rustls 0.23 will not choose a crypto provider for itself when more than
     // one is compiled in, and this tree has two: reqwest's rustls-tls brings

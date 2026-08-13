@@ -71,7 +71,8 @@ serde = "1.0.203"
 serde_derive = "1.0.203"
 serde_json = "1.0.117"
 directories = "6.0.0"
-syslog = "7.0.0"
+syslog = "7.0.0"                                              # optional remote sink, see src/logging.rs
+hostname = "0.4"                                              # RFC 3164 header; already in the tree via syslog
 simplelog = { version = "^0.12.2" , features = ["test"] }
 log = "0.4.21"
 lava_torrent = "0.11.1"

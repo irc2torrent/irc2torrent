@@ -26,6 +26,7 @@ mod auth;
 mod transports;
 pub mod supervisor;
 pub mod notify;
+pub mod logging;
 
 static IRC_CONFIG_FILE: &str = "irc.toml";
 static OPTIONS_CONFIG_FILE: &str = "options.toml";
