@@ -6,7 +6,7 @@ pub mod torrent {
     use anyhow::Error;
     use base64;
     use base64::Engine as _;
-    use log::{error, info};
+    use log::{error, info, warn};
     use pub_sub::{PubSub, Subscription};
     use regex::Regex;
 
@@ -33,6 +33,42 @@ pub mod torrent {
         Wanted,
         NotWanted,
         Rejected,
+    }
+
+    /// What the filters decided, and which pattern decided it.
+    ///
+    /// Separate from `Filter` because the caller only ever acts on
+    /// wanted/rejected/not-wanted, while the *reason* exists purely to be
+    /// reported. Keeping it separate also makes the decision a pure function of
+    /// the two pattern lists, which is the only way to test it: building a real
+    /// `TorrentProcessor` needs a live torrent client.
+    #[derive(Debug, PartialEq)]
+    enum Decision<'a> {
+        Wanted(&'a str),
+        /// `overrode` is the download pattern that also matched, if any -- the
+        /// difference between "the filter worked" and "your reject list is
+        /// eating things you asked for".
+        Rejected {
+            by: &'a str,
+            overrode: Option<&'a str>,
+        },
+        NotWanted,
+    }
+
+    /// Reject wins over match, as it always has. The download list is consulted
+    /// afterwards only to explain *why*, and only once a reject has already
+    /// hit -- so the ordinary path costs exactly what it did before.
+    fn decide<'a>(name: &str, dl: &'a [Regex], reject: &'a [Regex]) -> Decision<'a> {
+        if let Some(r) = reject.iter().find(|r| r.is_match(name)) {
+            return Decision::Rejected {
+                by: r.as_str(),
+                overrode: dl.iter().find(|d| d.is_match(name)).map(Regex::as_str),
+            };
+        }
+        match dl.iter().find(|d| d.is_match(name)) {
+            Some(d) => Decision::Wanted(d.as_str()),
+            None => Decision::NotWanted,
+        }
     }
 
     /// Why a torrent is being considered, which decides whether the download
@@ -178,26 +214,48 @@ pub mod torrent {
             let dl_regexes = self.options.borrow().get_dl_regexes();
             let reject_regexes = self.options.borrow().get_reject_regexes();
 
-            for regex in &reject_regexes {
-                if regex.is_match(name) {
-                    info!("Torrent '{name}' rejected by '{}'", regex.as_str());
-                    return Filter::Rejected;
+            match decide(name, &dl_regexes, &reject_regexes) {
+                // The case worth interrupting someone for: a pattern the user
+                // wrote to catch this release did catch it, and a reject pattern
+                // threw it away anyway. Either they meant that, or a reject
+                // pattern is broader than they realised and is quietly eating
+                // releases they asked for -- and nothing else in the log tells
+                // those two apart.
+                Decision::Rejected { by, overrode: Some(wanted) } => {
+                    warn!(
+                        "Torrent '{name}' matched '{wanted}' but was rejected by '{by}'; not downloading"
+                    );
+                    // Gated by `on_warning`, off by default. Deduplicated on the
+                    // pair of patterns rather than the release name, so an
+                    // over-broad reject rule reads as one fact with a count
+                    // instead of one message per release it ate.
+                    self.notifier.send(Event::RejectedDespiteMatch {
+                        name: name.to_string(),
+                        wanted: wanted.to_string(),
+                        reject: by.to_string(),
+                    });
+                    Filter::Rejected
+                }
+                // A reject discarding something no pattern asked for is just the
+                // filter working. Noise at anything above info.
+                Decision::Rejected { by, overrode: None } => {
+                    info!("Torrent '{name}' rejected by '{by}'");
+                    Filter::Rejected
+                }
+                Decision::Wanted(pattern) => {
+                    info!("Torrent '{name}' matched '{pattern}'");
+                    Filter::Wanted
+                }
+                // Silent before, which left a filtered-out torrent looking
+                // exactly like a broken client.
+                Decision::NotWanted => {
+                    info!(
+                        "Torrent '{name}' matches none of the {} download pattern(s); ignoring",
+                        dl_regexes.len()
+                    );
+                    Filter::NotWanted
                 }
             }
-            for regex in &dl_regexes {
-                if regex.is_match(name) {
-                    info!("Torrent '{name}' matched '{}'", regex.as_str());
-                    return Filter::Wanted;
-                }
-            }
-
-            // Silent before, which left a filtered-out torrent looking exactly
-            // like a broken client.
-            info!(
-                "Torrent '{name}' matches none of the {} download pattern(s); ignoring",
-                dl_regexes.len()
-            );
-            Filter::NotWanted
         }
 
         /// `&self`, not `&mut self`: it only reads `torrent_client`, and the
@@ -343,6 +401,62 @@ pub mod torrent {
         #[test]
         fn an_announcement_still_consults_the_download_filters() {
             assert!(Trigger::Announcement.consults_filters());
+        }
+
+        fn regexes(patterns: &[&str]) -> Vec<Regex> {
+            patterns.iter().map(|p| Regex::new(p).unwrap()).collect()
+        }
+
+        /// The distinction the warning exists for: a release the user's own
+        /// match list asked for, thrown away by a reject pattern.
+        #[test]
+        fn a_reject_that_overrode_a_match_says_which_pattern_wanted_it() {
+            let dl = regexes(&[".*2160p.*"]);
+            let reject = regexes(&["(?i).*GERMAN.*"]);
+            assert_eq!(
+                decide("Some.Release.2160p.GERMAN.WEB", &dl, &reject),
+                Decision::Rejected { by: "(?i).*GERMAN.*", overrode: Some(".*2160p.*") }
+            );
+        }
+
+        /// The ordinary case, which must stay quiet: nothing asked for it, so
+        /// the reject pattern discarding it is the filter doing its job.
+        #[test]
+        fn a_reject_of_something_unwanted_overrode_nothing() {
+            let dl = regexes(&[".*2160p.*"]);
+            let reject = regexes(&["(?i).*GERMAN.*"]);
+            assert_eq!(
+                decide("Some.Release.1080p.GERMAN.WEB", &dl, &reject),
+                Decision::Rejected { by: "(?i).*GERMAN.*", overrode: None }
+            );
+        }
+
+        /// Reject still wins over match -- the warning reports the outcome, it
+        /// does not change it.
+        #[test]
+        fn reject_still_beats_match() {
+            let dl = regexes(&[".*2160p.*"]);
+            let reject = regexes(&["(?i).*GERMAN.*"]);
+            assert!(matches!(
+                decide("Some.Release.2160p.GERMAN.WEB", &dl, &reject),
+                Decision::Rejected { .. }
+            ));
+        }
+
+        #[test]
+        fn a_plain_match_names_the_pattern_that_matched() {
+            let dl = regexes(&[".*1080p.*", ".*2160p.*"]);
+            assert_eq!(
+                decide("Some.Release.2160p.WEB", &dl, &[]),
+                Decision::Wanted(".*2160p.*")
+            );
+        }
+
+        #[test]
+        fn matching_nothing_is_not_wanted() {
+            let dl = regexes(&[".*2160p.*"]);
+            let reject = regexes(&["(?i).*GERMAN.*"]);
+            assert_eq!(decide("Some.Release.720p.WEB", &dl, &reject), Decision::NotWanted);
         }
     }
 }

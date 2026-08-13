@@ -305,6 +305,20 @@ on_download_finished = true
 # Free space on disk_path dropping below disk_warn_percent.
 on_disk_low = true
 
+# A release one of your regex_for_downloads_match patterns asked for, thrown
+# away by a regex_for_downloads_reject_match pattern:
+#
+#   Rejected: Some.Release.2160p.GERMAN.WEB
+#             (matched '.*2160p.*', rejected by '(?i).*GERMAN.*')
+#
+# Reject still wins; this only tells you it happened. Off by default because a
+# broad reject list fires on most announcements, which is a legitimate way to
+# run. Turn it on when something you expected never arrived and you want to know
+# which of your own patterns ate it. Repeats collapse on the pair of patterns
+# rather than the release, so one over-broad rule is one line with a count.
+# Logged at WARN regardless of this setting.
+on_warning = false
+
 # One roll-up per day: added / finished / failed / restarts.
 daily_summary = false
 

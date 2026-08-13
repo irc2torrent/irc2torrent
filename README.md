@@ -642,9 +642,24 @@ on_failure           = true    # add failures, crash loops, rejected config, IRC
 on_torrent_added     = false   # every successful add
 on_download_finished = true    # a torrent reaching 100%
 on_disk_low          = true    # free space below disk_warn_percent
+on_warning           = false   # a release your match list wanted, dropped by your reject list
 daily_summary        = false   # one roll-up a day
 on_start             = true    # the bot came up, and IRC came back
 ```
+
+`on_warning` covers the one filter outcome worth being told about: an announcement that matched
+`regex_for_downloads_match` and was then thrown away by `regex_for_downloads_reject_match`. Reject
+still wins — this only reports it:
+
+```
+Rejected: Some.Release.2160p.GERMAN.WEB (matched '.*2160p.*', rejected by '(?i).*GERMAN.*')
+```
+
+Off by default, because a deliberately broad reject list fires on most announcements and running
+that way is perfectly reasonable. Turn it on when a release you expected never arrived and you want
+to know which of your own patterns ate it. Repeats collapse on the **pair of patterns**, not the
+release name, so one over-broad rule reads as a single line with a count rather than one message per
+release it dropped. It is logged at `WARN` either way, whether or not you enable the notification.
 
 `on_start` is the greeting: **`irc2torrent 0.13.0 is up (commands, ntfy, telegram)`**, sent to every
 configured target when the bot finishes starting, and again as `IRC is back (was down 94s)` when a

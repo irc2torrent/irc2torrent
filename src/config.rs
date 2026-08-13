@@ -380,6 +380,14 @@ pub mod config {
         pub on_download_finished: bool,
         /// Free space on `disk_path` falling below `disk_warn_percent`.
         pub on_disk_low: bool,
+        /// A release one of your download patterns asked for, thrown away by a
+        /// reject pattern.
+        ///
+        /// Off by default: a deliberately broad reject list fires constantly on
+        /// a busy announce channel, and that is a legitimate way to run. Turn it
+        /// on when a release you expected never arrived and you want to know
+        /// which of your own patterns ate it.
+        pub on_warning: bool,
         /// One roll-up per day of everything above.
         pub daily_summary: bool,
         /// The bot coming up, and IRC coming back after an outage that was
@@ -427,6 +435,7 @@ pub mod config {
         pub on_torrent_added: Option<bool>,
         pub on_download_finished: Option<bool>,
         pub on_disk_low: Option<bool>,
+        pub on_warning: Option<bool>,
         pub daily_summary: Option<bool>,
         pub on_start: Option<bool>,
     }
@@ -473,6 +482,7 @@ pub mod config {
                 on_torrent_added: false,
                 on_download_finished: true,
                 on_disk_low: true,
+                on_warning: false,
                 daily_summary: false,
                 on_start: true,
                 digest_seconds: 300,

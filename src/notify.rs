@@ -50,6 +50,14 @@ pub enum Event {
     Started { version: &'static str, integrations: String },
     ConfigRejected(String),
     DiskLow { path: String, percent_free: u64, free_gib: u64 },
+    /// A release a download pattern asked for, thrown away by a reject pattern.
+    ///
+    /// Not a failure -- the filters did what they were told -- but the one
+    /// filter outcome worth being told about, because it is indistinguishable
+    /// from a reject pattern that is quietly broader than intended. Off by
+    /// default: on a busy announce channel a deliberately broad reject list
+    /// fires constantly, and that is a legitimate way to run.
+    RejectedDespiteMatch { name: String, wanted: String, reject: String },
     /// Sent by `cmd:testnotify`, and deliberately exempt from every filter and
     /// from the digest delay: its whole purpose is to answer "is this working?"
     /// immediately.
@@ -74,6 +82,9 @@ impl Event {
                 filter.on_download_finished.unwrap_or(global.on_download_finished)
             }
             Event::DiskLow { .. } => filter.on_disk_low.unwrap_or(global.on_disk_low),
+            Event::RejectedDespiteMatch { .. } => {
+                filter.on_warning.unwrap_or(global.on_warning)
+            }
             // The greeting and the all-clear share a switch: both say "it is
             // working now", and wanting one without the other makes no sense.
             Event::Started { .. } | Event::IrcReconnected(_) => {
@@ -102,6 +113,11 @@ impl Event {
             Event::Started { version, .. } => format!("started:{version}"),
             Event::ConfigRejected(r) => format!("config:{r}"),
             Event::DiskLow { path, .. } => format!("disk:{path}"),
+            // Keyed on the pair of patterns, not the release: twenty releases
+            // lost to one over-broad reject rule is one fact, not twenty.
+            Event::RejectedDespiteMatch { wanted, reject, .. } => {
+                format!("rejected:{wanted}:{reject}")
+            }
             Event::Test => "test".to_string(),
         }
     }
@@ -123,6 +139,9 @@ impl Event {
             Event::DiskLow { path, percent_free, free_gib } => {
                 format!("Low disk space on {path}: {percent_free}% free ({free_gib} GiB)")
             }
+            Event::RejectedDespiteMatch { name, wanted, reject } => {
+                format!("Rejected: {name} (matched '{wanted}', rejected by '{reject}')")
+            }
             Event::Test => "Test notification -- if you are reading this, it works.".to_string(),
         }
     }
@@ -134,6 +153,7 @@ impl Event {
             Event::DownloadFinished(_) => Some("finished"),
             Event::AddFailed { .. } => Some("failed"),
             Event::ServiceRestarted(_) => Some("restarts"),
+            Event::RejectedDespiteMatch { .. } => Some("rejected"),
             _ => None,
         }
     }
@@ -1451,6 +1471,63 @@ mod test {
         assert_eq!(body, "Finished: Some Release");
     }
 
+    fn rejected() -> Event {
+        Event::RejectedDespiteMatch {
+            name: "Some.Release.2160p.GERMAN.WEB".into(),
+            wanted: ".*2160p.*".into(),
+            reject: "(?i).*GERMAN.*".into(),
+        }
+    }
+
+    /// Off unless asked for: a broad reject list fires on every announcement,
+    /// and running that way is legitimate.
+    #[test]
+    fn a_reject_warning_is_silent_by_default() {
+        let defaults = NotificationOptions::default();
+        assert!(!defaults.on_warning);
+        assert!(!rejected().enabled_by(&defaults, &EventFilter::default()));
+    }
+
+    #[test]
+    fn a_reject_warning_is_sent_once_on_warning_is_set() {
+        let opts = NotificationOptions { on_warning: true, ..NotificationOptions::default() };
+        assert!(rejected().enabled_by(&opts, &EventFilter::default()));
+    }
+
+    /// Per-backend override, like every other switch: IRC can carry these while
+    /// email does not.
+    #[test]
+    fn a_backend_can_override_the_reject_warning() {
+        let opts = NotificationOptions { on_warning: false, ..NotificationOptions::default() };
+        let want = EventFilter { on_warning: Some(true), ..EventFilter::default() };
+        assert!(rejected().enabled_by(&opts, &want));
+    }
+
+    /// One over-broad reject rule eating twenty releases is one fact, not
+    /// twenty lines -- so the key is the pattern pair, not the release name.
+    #[test]
+    fn reject_warnings_collapse_per_pattern_pair_not_per_release() {
+        let a = rejected();
+        let b = Event::RejectedDespiteMatch {
+            name: "Another.Release.2160p.GERMAN.WEB".into(),
+            wanted: ".*2160p.*".into(),
+            reject: "(?i).*GERMAN.*".into(),
+        };
+        let (subject, body) = render(&[a, b]);
+        assert!(subject.contains("(x2)"), "{subject}");
+        assert_eq!(body.lines().count(), 1, "{body}");
+    }
+
+    /// The message has to name both patterns: knowing a release was dropped is
+    /// useless without knowing which of your own rules dropped it.
+    #[test]
+    fn a_reject_warning_names_both_patterns() {
+        let line = rejected().line();
+        assert!(line.contains("Some.Release.2160p.GERMAN.WEB"), "{line}");
+        assert!(line.contains(".*2160p.*"), "{line}");
+        assert!(line.contains("(?i).*GERMAN.*"), "{line}");
+    }
+
     /// A transport with no subject field must not print the event twice.
     ///
     /// The subject for a single event *is* that event's line, which is correct
@@ -1991,6 +2068,7 @@ mod test {
             on_torrent_added: Some(false),
             on_download_finished: Some(false),
             on_disk_low: Some(false),
+            on_warning: Some(false),
             daily_summary: Some(false),
             on_start: Some(false),
         };
