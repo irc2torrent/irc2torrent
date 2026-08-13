@@ -241,7 +241,7 @@ to it, and restarts children with capped backoff.
 | Variable | Default | Purpose |
 |---|---|---|
 | `IRC2TORRENT_SUPERVISE` | `1` *(in the image)* | Run as container init. Accepts `1`/`true`/`yes`/`on`. Unset it to run the bot alone. |
-| `IRC2TORRENT_RAW_CHILD_LOGS` | `0` | By default child output is captured and prefixed `[rtorrent]` / `[flood]`. Set to `1` for plain inheritance, which keeps Flood's output as machine-parseable JSON for a log shipper. |
+| `IRC2TORRENT_RAW_CHILD_LOGS` | `0` | By default child output is captured and prefixed `[rtorrent]` / `[flood]`. Set to `1` for plain inheritance, which keeps Flood's output as machine-parseable JSON for a log shipper. Mutually exclusive with `IRC2TORRENT_SYSLOG_CHILD_LOGS` — see [Remote syslog](#remote-syslog). |
 | `RTORRENT_BIN` | `/usr/local/bin/rtorrent` | rTorrent executable. If missing, rTorrent simply is not supervised. |
 | `RTORRENT_RC` | `/etc/rtorrent/rtorrent.rc` | Config passed as `-n -o import=…`. |
 | `RTORRENT_SOCKET` | `/config/.local/share/rtorrent/rtorrent.sock` | Where the supervisor **waits** for the SCGI socket before starting Flood, so Flood's first `system.listMethods` probe succeeds and it settles on JSON-RPC rather than the XML-RPC fallback. It does **not** move the socket — `network.scgi.open_local` in the rc does. Set only this one and the supervisor warns, then waits out the full 60s for a socket nothing will create. |
@@ -253,6 +253,47 @@ to it, and restarts children with capped backoff.
 | `NODE_BIN` | `/usr/bin/node` | Node executable used to run Flood. |
 | `FLOOD_ENTRY` | `/opt/flood/dist/index.js` | Flood entry point. If missing, Flood is not supervised. |
 | `HOME` | `/config` | Root of all persistent state; also where irc2torrent looks for its own config. |
+
+### Remote syslog
+
+Off unless `IRC2TORRENT_SYSLOG` is set. When it is, everything irc2torrent logs goes to the
+collector as well as to `docker logs` — no shipper, no sidecar, no file to tail. Lines are
+RFC 3164, which is what QNAP's QuLog Center, rsyslog, syslog-ng and Synology all accept.
+
+```sh
+docker run -e IRC2TORRENT_SYSLOG=udp://192.168.1.10:514 …    # QuLog Center on a QNAP NAS
+```
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `IRC2TORRENT_SYSLOG` | *(unset — off)* | Where to send. `udp://host[:port]`, `tcp://host[:port]`, `unix` for the platform default socket, or `unix:/path`. A bare `host[:port]` means UDP. Port defaults to `514`. IPv6 needs brackets: `udp://[fd00::1]:514`. |
+| `IRC2TORRENT_SYSLOG_TAG` | `irc2torrent` | Program name in the header — what most collectors group and filter by. |
+| `IRC2TORRENT_SYSLOG_LEVEL` | `info` | Threshold for this sink alone; the terminal keeps its own. `off`/`error`/`warn`/`info`/`debug`/`trace`. |
+| `IRC2TORRENT_SYSLOG_FACILITY` | `daemon` | `daemon`, `user`, `local0`–`local7`, … Both `local3` and `LOG_LOCAL3` are accepted. |
+| `IRC2TORRENT_SYSLOG_HOSTNAME` | *(system hostname)* | Hostname in the header. Inside a container that defaults to the short container id, which changes on every recreate — set this, or `--hostname`, if you group by host. |
+| `IRC2TORRENT_SYSLOG_CHILD_LOGS` | `0` | Also relay rTorrent and Flood output through the sink. See below. |
+
+**UDP is the default deliberately.** The syslog sink is synchronous, and logging calls sit on the
+IRC path, so a `tcp://` target that stops answering can stall the bot. Use TCP only if you need
+its delivery guarantees and the collector is reliably up.
+
+A target that cannot be opened is **never fatal**: the reason is logged once and the bot keeps
+running without the remote sink. Losing the bot because a NAS moved would be the worse outcome.
+
+**Child logs.** By default the sink carries only irc2torrent's own lines — rTorrent and Flood
+output goes straight to stderr and never touches the `log` crate, so it stays in `docker logs`
+only. `IRC2TORRENT_SYSLOG_CHILD_LOGS=1` routes it through `log` instead, so it reaches the
+collector too. One line still, not two, but it picks up irc2torrent's timestamp and level prefix —
+which is exactly what destroys Flood's stdout as machine-parseable JSON. Everything lands at
+`info`, since neither child's severity convention maps onto `log`'s reliably.
+
+This flag needs the default capture path, so it does nothing when `IRC2TORRENT_RAW_CHILD_LOGS=1`:
+that makes children inherit stdio directly, and irc2torrent never sees their output at all. Setting
+both is a contradiction — pick one.
+
+Logging is env-only, not an `options.toml` key, and changes need a restart. The logger is built
+before the config file is read and `log`'s global logger can only be set once per process, so a
+syslog sink could never take part in the live reload the rest of the config gets.
 
 ### Flood
 
