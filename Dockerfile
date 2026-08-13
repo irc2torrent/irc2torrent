@@ -237,7 +237,20 @@ LABEL org.opencontainers.image.title="flood_rtorrent_irc2torrent" \
 # re-add the 57 MB rtorrent binary in a second layer and drag in headers,
 # static libraries and pkgconfig files that no runtime needs.
 COPY --from=userland /rootfs/ /
-COPY --from=flood-build /usr/src/app /opt/flood
+# `dist`, not the whole build tree.
+#
+# Flood declares no runtime `dependencies` at all -- all 131 are dev -- and its
+# build bundles everything into dist/. Copying /usr/src/app therefore shipped
+# 579 MB of build toolchain into the runtime: SWC, tsc, rolldown, storybook,
+# lightningcss, sass and two esbuild binaries. esbuild is written in Go, so the
+# image reported a Go stdlib nobody here could patch -- one CVSS 10.0 and 16
+# more highs, in a compiler that never runs at runtime. Most of the remaining
+# npm findings lived in that tree too.
+#
+# Verified before narrowing it: with dist/ alone the server starts, serves the
+# UI, and answers a POST whose body schema fastify compiles through ajv -- the
+# one lazily-required package that could plausibly have escaped the bundle.
+COPY --from=flood-build /usr/src/app/dist /opt/flood/dist
 COPY docker/rtorrent.rc /etc/rtorrent/rtorrent.rc
 
 # The DHI runtime is non-root (uid 1000) and ships no shell, adduser or chown,
@@ -369,7 +382,7 @@ LABEL org.opencontainers.image.title="flood_qbittorrent_irc2torrent" \
       org.opencontainers.image.source="https://github.com/irc2torrent/irc2torrent"
 
 COPY --from=qbt-userland /rootfs/ /
-COPY --from=flood-build /usr/src/app /opt/flood
+COPY --from=flood-build /usr/src/app/dist /opt/flood/dist
 COPY docker/qBittorrent.conf /etc/qbittorrent/qBittorrent.conf
 
 # QT_PLUGIN_PATH is redundant -- the plugins are staged at the same absolute
@@ -410,7 +423,7 @@ ENTRYPOINT ["/usr/local/bin/irc2torrent"]
 FROM ${NODE_DEV_IMAGE} AS qbt-debug
 
 COPY --from=irc2torrent-build /dist/ /
-COPY --from=flood-build /usr/src/app /opt/flood
+COPY --from=flood-build /usr/src/app/dist /opt/flood/dist
 COPY docker/qBittorrent.conf /etc/qbittorrent/qBittorrent.conf
 COPY --from=irc2torrent-build /dist/usr/local/bin/irc2torrent /app/irc2torrent
 
@@ -455,7 +468,7 @@ FROM ${NODE_DEV_IMAGE} AS debug
 COPY --from=libtorrent-build /dist/ /
 COPY --from=rtorrent-build /dist/ /
 COPY --from=irc2torrent-build /dist/ /
-COPY --from=flood-build /usr/src/app /opt/flood
+COPY --from=flood-build /usr/src/app/dist /opt/flood/dist
 COPY docker/rtorrent.rc /etc/rtorrent/rtorrent.rc
 COPY --from=irc2torrent-build /dist/usr/local/bin/irc2torrent /app/irc2torrent
 
