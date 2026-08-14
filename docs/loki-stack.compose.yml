@@ -412,3 +412,14 @@ configs:
           url: http://prometheus:9090
           isDefault: false
           editable: true
+          jsonData:
+            # MUST match prometheus.scrape's interval in the Alloy config above.
+            #
+            # Grafana derives its rate interval from this value, as
+            # max(panel interval + timeInterval, 4 x timeInterval). Leave it at
+            # the 15s default while actually scraping every 60s and rate() gets
+            # a 60s window holding a single sample -- too few to compute a rate,
+            # so every rate()-based panel silently draws nothing. Instant
+            # queries like memory keep working, which makes it look like a
+            # partial outage rather than a units mismatch.
+            timeInterval: 60s
