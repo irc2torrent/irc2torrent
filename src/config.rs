@@ -34,7 +34,8 @@ pub mod config {
     pub struct LoadedOptions {
         data: OptionData,
         announce_regex: Regex,
-        dl_regexes: Vec<Regex>,
+        /// `data.regex_for_downloads_match` compiled, entry rules included.
+        dl_watches: Vec<CompiledWatch>,
         reject_regexes: Vec<Regex>,
         /// `data.field_filters` compiled, in the map's sorted order so the
         /// first rule to veto is the same one every time.
@@ -57,11 +58,64 @@ pub mod config {
                     .collect()
             };
 
-            let dl_regexes = compile_all(&data.regex_for_downloads_match, "regex_for_downloads_match")?;
             let reject_regexes = compile_all(
                 &data.regex_for_downloads_reject_match,
                 "regex_for_downloads_reject_match",
             )?;
+
+            // Compiles one `[field_filters.*]` map, wherever it came from.
+            let compile_filters = |filters: &BTreeMap<String, FieldFilter>,
+                                   where_: &str|
+             -> Result<Vec<(String, CompiledFieldFilter)>, Error> {
+                filters
+                    .iter()
+                    .map(|(field, f)| {
+                        let compile =
+                            |p: &Option<String>, which: &str| -> Result<Option<Regex>, Error> {
+                                p.as_deref()
+                                    .map(|p| {
+                                        Regex::new(p).map_err(|e| {
+                                            Error::msg(format!(
+                                                "{where_}{field}.{which} is not a valid regex: {e}"
+                                            ))
+                                        })
+                                    })
+                                    .transpose()
+                            };
+                        Ok((
+                            field.clone(),
+                            CompiledFieldFilter {
+                                matches: compile(&f.matches, "matches")?,
+                                reject_matching: compile(&f.reject_matching, "reject_matching")?,
+                            },
+                        ))
+                    })
+                    .collect()
+            };
+
+            let dl_watches = data
+                .regex_for_downloads_match
+                .iter()
+                .map(|entry| {
+                    let regex = Regex::new(entry.pattern()).map_err(|e| {
+                        Error::msg(format!(
+                            "regex_for_downloads_match contains an invalid regex: {e}"
+                        ))
+                    })?;
+                    let field_filters = match entry.field_filters() {
+                        Some(f) => compile_filters(
+                            f,
+                            &format!("regex_for_downloads_match entry '{}': field_filters.", entry.pattern()),
+                        )?,
+                        None => Vec::new(),
+                    };
+                    Ok(CompiledWatch {
+                        regex,
+                        require_fields: entry.require_fields().to_vec(),
+                        field_filters,
+                    })
+                })
+                .collect::<Result<Vec<_>, Error>>()?;
 
             // Before the platform check but after the regexes, matching the
             // ordering rationale below: this one is also about a regex field.
@@ -70,32 +124,10 @@ pub mod config {
                 &data.captures,
                 &data.require_fields,
                 &data.field_filters,
+                &data.regex_for_downloads_match,
             )?;
 
-            let field_filters = data
-                .field_filters
-                .iter()
-                .map(|(field, f)| {
-                    let compile = |p: &Option<String>, which: &str| -> Result<Option<Regex>, Error> {
-                        p.as_deref()
-                            .map(|p| {
-                                Regex::new(p).map_err(|e| {
-                                    Error::msg(format!(
-                                        "field_filters.{field}.{which} is not a valid regex: {e}"
-                                    ))
-                                })
-                            })
-                            .transpose()
-                    };
-                    Ok((
-                        field.clone(),
-                        CompiledFieldFilter {
-                            matches: compile(&f.matches, "matches")?,
-                            reject_matching: compile(&f.reject_matching, "reject_matching")?,
-                        },
-                    ))
-                })
-                .collect::<Result<Vec<_>, Error>>()?;
+            let field_filters = compile_filters(&data.field_filters, "field_filters.")?;
 
             // After the regexes, so the three tests that assert on regex field
             // names keep getting the regex error rather than this one.
@@ -105,7 +137,7 @@ pub mod config {
             // `UrlTemplate::placeholder_names`.
             validate_platform(&data.platform, &announce_regex)?;
 
-            Ok(Self { data, announce_regex, dl_regexes, reject_regexes, field_filters })
+            Ok(Self { data, announce_regex, dl_watches, reject_regexes, field_filters })
         }
     }
 
@@ -121,6 +153,7 @@ pub mod config {
         captures: &BTreeMap<String, CaptureOptions>,
         require_fields: &[String],
         field_filters: &BTreeMap<String, FieldFilter>,
+        watches: &[WatchEntry],
     ) -> Result<(), Error> {
         let declared: Vec<&str> = re.capture_names().flatten().collect();
 
@@ -178,6 +211,19 @@ pub mod config {
         }
         for field in field_filters.keys() {
             check(field, &format!("[field_filters.{field}]"))?;
+        }
+        // Per-entry rules get the same treatment, named by their pattern so the
+        // error points at the line to fix rather than at the list.
+        for entry in watches {
+            let at = format!("regex_for_downloads_match entry '{}'", entry.pattern());
+            for field in entry.require_fields() {
+                check(field, &format!("{at}: require_fields"))?;
+            }
+            if let Some(filters) = entry.field_filters() {
+                for field in filters.keys() {
+                    check(field, &format!("{at}: field_filters.{field}"))?;
+                }
+            }
         }
 
         // A warning rather than an error: `file` and `key` are supplied by the
@@ -375,7 +421,7 @@ pub mod config {
         platform: PlatformSection,
         clients: Vec<TorrentClientOption>,
         command_options: CommandOptions,
-        regex_for_downloads_match: Vec<String>,
+        regex_for_downloads_match: Vec<WatchEntry>,
         regex_for_downloads_reject_match: Vec<String>,
         regex_for_announce_match: String,
         /// Captures that must have participated, or the release is skipped.
@@ -416,6 +462,68 @@ pub mod config {
         telegram: Option<TelegramOptions>,
         #[serde(default)]
         slack: Option<SlackOptions>,
+    }
+
+    /// One entry in `regex_for_downloads_match`.
+    ///
+    /// Untagged, so a plain string still parses and every config written before
+    /// per-entry rules existed keeps working unchanged -- and `cmd:addtowatchlist`
+    /// keeps appending strings to the same list that `cmd:removewatch` indexes.
+    ///
+    /// TOML round-trips a mixed array losslessly, one entry per line:
+    ///
+    /// ```toml
+    /// regex_for_downloads_match = [
+    ///     "Some Release.*1080p.*",
+    ///     { match = "Star Trek.*2160p.*", require_fields = ["freeleech"] },
+    /// ]
+    /// ```
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(untagged)]
+    pub enum WatchEntry {
+        /// A bare pattern. The global field rules apply to it unchanged.
+        Pattern(String),
+        /// A pattern carrying its own rules, which replace the global ones for
+        /// the fields they name.
+        Detailed {
+            #[serde(rename = "match")]
+            pattern: String,
+            #[serde(default, skip_serializing_if = "Vec::is_empty")]
+            require_fields: Vec<String>,
+            #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+            field_filters: BTreeMap<String, FieldFilter>,
+        },
+    }
+
+    impl WatchEntry {
+        pub fn pattern(&self) -> &str {
+            match self {
+                WatchEntry::Pattern(p) => p,
+                WatchEntry::Detailed { pattern, .. } => pattern,
+            }
+        }
+
+        fn require_fields(&self) -> &[String] {
+            match self {
+                WatchEntry::Pattern(_) => &[],
+                WatchEntry::Detailed { require_fields, .. } => require_fields,
+            }
+        }
+
+        fn field_filters(&self) -> Option<&BTreeMap<String, FieldFilter>> {
+            match self {
+                WatchEntry::Pattern(_) => None,
+                WatchEntry::Detailed { field_filters, .. } => Some(field_filters),
+            }
+        }
+    }
+
+    /// A watch entry with its patterns compiled.
+    #[derive(Debug, Clone)]
+    pub struct CompiledWatch {
+        pub regex: Regex,
+        pub require_fields: Vec<String>,
+        pub field_filters: Vec<(String, CompiledFieldFilter)>,
     }
 
     /// A value rule for one captured field.
@@ -561,7 +669,10 @@ pub mod config {
                 platform: PlatformSection::default(),
                 clients: vec![default_client()],
                 command_options: CommandOptions::default(),
-                regex_for_downloads_match: vec!["Some Regex to match.*1080p.*".to_string(), "Another Release.*S02.*1080p.*WEB.*".to_string()],
+                regex_for_downloads_match: vec![
+                    WatchEntry::Pattern("Some Regex to match.*1080p.*".to_string()),
+                    WatchEntry::Pattern("Another Release.*S02.*1080p.*WEB.*".to_string()),
+                ],
                 regex_for_downloads_reject_match: vec![".*NORDIC.*".to_string(), ".*GERMAN.*".to_string()],
                 // An example of the shape, not a working pattern for any
                 // particular network: every tracker announces differently, so
@@ -1515,8 +1626,9 @@ pub mod config {
             self.option_data.lock().unwrap().field_filters.clone()
         }
 
-        pub fn get_dl_regexes(&self) -> Vec<Regex> {
-            self.option_data.lock().unwrap().dl_regexes.clone()
+        /// The download patterns with their per-entry rules attached.
+        pub fn get_dl_watches(&self) -> Vec<CompiledWatch> {
+            self.option_data.lock().unwrap().dl_watches.clone()
         }
 
         pub fn get_reject_regexes(&self) -> Vec<Regex> {
@@ -1578,8 +1690,18 @@ pub mod config {
         /// shows what is actually in the file, and so it reads from the same vec
         /// the index refers to -- the compiled cache is derived from this one and
         /// could not drift, but there is no reason to route a listing through it.
+        /// Just the pattern text, for `cmd:watchlist` and `cmd:removewatch`.
+        /// Positions match `regex_for_downloads_match`, which is what
+        /// `remove_dl_regex` indexes.
         pub fn get_dl_patterns(&self) -> Vec<String> {
-            self.option_data.lock().unwrap().data.regex_for_downloads_match.clone()
+            self.option_data
+                .lock()
+                .unwrap()
+                .data
+                .regex_for_downloads_match
+                .iter()
+                .map(|e| e.pattern().to_string())
+                .collect()
         }
 
         /// `&self`, not `&mut self`: `mutate_options` already takes `&self`, and
@@ -1597,7 +1719,12 @@ pub mod config {
                 error!("Refusing to add an invalid regex '{regex}': {e}");
                 return Err(Error::msg(format!("'{regex}' is not a valid regex: {e}")));
             }
-            self.mutate_options(|data| data.regex_for_downloads_match.push(regex)).await;
+            // Appended as a bare pattern: the global rules apply to it. Per-entry
+            // rules are an options.toml edit, not something a command sets.
+            self.mutate_options(|data| {
+                data.regex_for_downloads_match.push(WatchEntry::Pattern(regex))
+            })
+            .await;
             Ok(())
         }
 
@@ -1877,7 +2004,10 @@ pub mod config {
         fn data_with(announce: &str, dl: Vec<&str>, reject: Vec<&str>) -> OptionData {
             OptionData {
                 regex_for_announce_match: announce.to_string(),
-                regex_for_downloads_match: dl.into_iter().map(String::from).collect(),
+                regex_for_downloads_match: dl
+                    .into_iter()
+                    .map(|p| WatchEntry::Pattern(p.to_string()))
+                    .collect(),
                 regex_for_downloads_reject_match: reject.into_iter().map(String::from).collect(),
                 // ..option_data_for_test(), not ..OptionData::default(): these
                 // cases are about the regexes, and the shipped default has no
@@ -1895,7 +2025,7 @@ pub mod config {
             ))
             .expect("valid patterns should load");
 
-            assert_eq!(loaded.dl_regexes.len(), 2);
+            assert_eq!(loaded.dl_watches.len(), 2);
             assert_eq!(loaded.reject_regexes.len(), 1);
             assert!(loaded.announce_regex.is_match("Name:'Thing' uploaded /torrent/12345"));
         }
@@ -2065,6 +2195,92 @@ pub mod config {
             let text = toml::to_string_pretty(&data).unwrap();
             let back: OptionData = toml::from_str(&text).expect("round trip");
             assert_eq!(back, data, "rendered as:\n{text}");
+        }
+
+        #[test]
+        fn a_bare_pattern_and_a_detailed_entry_share_one_list() {
+            // Backward compatibility is the point: a config written before
+            // per-entry rules existed parses unchanged, and both forms coexist.
+            let text = r#"
+                regex_for_downloads_match = [
+                    "Some Release.*1080p.*",
+                    { match = "Star Trek.*2160p.*", require_fields = ["freeleech"] },
+                ]
+            "#;
+            #[derive(serde_derive::Deserialize)]
+            struct Just {
+                regex_for_downloads_match: Vec<WatchEntry>,
+            }
+            let parsed: Just = toml::from_str(text).expect("mixed array should parse");
+            assert_eq!(parsed.regex_for_downloads_match.len(), 2);
+            assert_eq!(
+                parsed.regex_for_downloads_match[0],
+                WatchEntry::Pattern("Some Release.*1080p.*".to_string())
+            );
+            assert_eq!(parsed.regex_for_downloads_match[1].pattern(), "Star Trek.*2160p.*");
+        }
+
+        #[test]
+        fn a_detailed_entry_round_trips() {
+            // mutate_options rewrites the whole file on cmd:addtowatchlist, so
+            // an entry that does not survive to_string_pretty would be
+            // destroyed by an unrelated command.
+            let mut data = option_data_for_test();
+            data.regex_for_announce_match =
+                r"(?P<name>.+)(?P<freeleech> free)? /torrent/(?P<id>\d+)".to_string();
+            data.regex_for_downloads_match = vec![
+                WatchEntry::Pattern("Plain.*1080p.*".to_string()),
+                WatchEntry::Detailed {
+                    pattern: "Star Trek.*2160p.*".to_string(),
+                    require_fields: vec!["freeleech".to_string()],
+                    field_filters: BTreeMap::new(),
+                },
+            ];
+
+            let text = toml::to_string_pretty(&data).unwrap();
+            let back: OptionData = toml::from_str(&text).expect("round trip");
+            assert_eq!(back, data, "rendered as:\n{text}");
+        }
+
+        #[test]
+        fn an_entry_rule_naming_no_capture_is_rejected_and_names_the_entry() {
+            let mut data = data_with(r"(?P<name>.+) /torrent/(?P<id>\d+)", vec![], vec![]);
+            data.regex_for_downloads_match = vec![WatchEntry::Detailed {
+                pattern: "Star Trek.*".to_string(),
+                require_fields: vec!["freelech".to_string()],
+                field_filters: BTreeMap::new(),
+            }];
+
+            let Err(err) = LoadedOptions::from_data(data) else {
+                panic!("an entry rule naming no capture must be rejected");
+            };
+            let err = err.to_string();
+            assert!(err.contains("Star Trek.*"), "should name the entry: {err}");
+            assert!(err.contains("freelech"), "{err}");
+        }
+
+        #[test]
+        fn an_invalid_entry_filter_regex_is_rejected() {
+            let mut data = data_with(
+                r"(?P<name>.+) (?P<category>\w+) /torrent/(?P<id>\d+)",
+                vec![],
+                vec![],
+            );
+            let mut filters = BTreeMap::new();
+            filters.insert(
+                "category".to_string(),
+                FieldFilter { matches: Some("(unclosed".to_string()), reject_matching: None },
+            );
+            data.regex_for_downloads_match = vec![WatchEntry::Detailed {
+                pattern: "Star Trek.*".to_string(),
+                require_fields: Vec::new(),
+                field_filters: filters,
+            }];
+
+            let Err(err) = LoadedOptions::from_data(data) else {
+                panic!("an invalid entry filter regex must be rejected");
+            };
+            assert!(err.to_string().contains("Star Trek.*"), "{err}");
         }
 
         #[test]
@@ -2397,7 +2613,8 @@ pub mod config {
                 text.contains("regex_for_downloads_match = [\n"),
                 "the list should open onto its own line:\n{text}"
             );
-            for pattern in &OptionData::default().regex_for_downloads_match {
+            for entry in &OptionData::default().regex_for_downloads_match {
+                let pattern = entry.pattern();
                 assert!(
                     text.contains(&format!("    \"{pattern}\",\n")),
                     "'{pattern}' should be on its own indented line:\n{text}"

@@ -172,15 +172,25 @@ URL needs an `authkey` from the announce line just names the group and uses `{au
 
 ### Filtering on those fields
 
-**"Only take freeleech" is one line**, given a `(?P<freeleech>...)?` group:
+**Rules can be per watch pattern.** An entry in `regex_for_downloads_match` can be a plain string,
+as it always was, or a table carrying its own rules:
 
 ```toml
-require_fields = ["freeleech"]
+regex_for_downloads_match = [
+    "Some Release.*1080p.*",
+    { match = "Star Trek.*2160p.*", require_fields = ["freeleech"] },
+]
 ```
 
-Every field named must have captured, or the release is skipped. For value rules:
+So "only take the 4K stuff if it's freeleech, anything for the rest" is expressible, which a blanket
+setting cannot say. Existing configs are unaffected — a bare string is still a valid entry, and
+`cmd:addtowatchlist` still appends one.
+
+The same rules can also be set globally, as a blanket default:
 
 ```toml
+require_fields = ["freeleech"]        # never take anything without it
+
 [field_filters.category]
 matches = "^Movies$"
 
@@ -188,19 +198,26 @@ matches = "^Movies$"
 reject_matching = "^(?i)anonymous$"
 ```
 
-Both patterns test the field's *values*, so a capture with a `split` is tested per element — one tag
-out of a list is enough for either rule to fire.
+#### How they compose
 
-These run **after** `regex_for_downloads_match` has already said yes, so they narrow what you asked
-for rather than widening it. A release nothing asked for is still reported as "not wanted", and the
-"your reject list ate a match" warning keeps meaning exactly what it says.
+1. `regex_for_downloads_reject_match` **wins first**, always.
+2. The release must match at least one entry, or it is simply not wanted.
+3. **A field named by a matching entry is that entry's to decide** — the global rule for that field
+   is dropped, not added to. Otherwise a blanket `require_fields` would silently overrule a line
+   that deliberately says "this one, freeleech or not".
+4. Global rules still apply to fields **no matching entry mentions**.
+5. Where several matching entries name the same field, **all of their rules must pass** — overlapping
+   patterns compound rather than one quietly winning.
+
+Both `matches` and `reject_matching` test the field's *values*, so a capture with a `split` is tested
+per element — one tag out of a list is enough for either to fire.
 
 An absent field answers the two rules oppositely, and neither answer is arbitrary: `matches` rejects
 it, since there is nothing to match against; `reject_matching` passes it, since a rule about what a
 value looks like cannot fire on a value that is not there. Use `require_fields` for presence.
 
-Naming a field your regex does not declare is a **startup error** — a typo would otherwise skip
-every release and look exactly like a dead announce channel.
+Naming a field your regex does not declare is a **startup error**, naming the entry — a typo would
+otherwise skip every release and look exactly like a dead announce channel.
 
 `cmd:addtorrent` bypasses all of this, as it already did for the name filters: someone who names a
 torrent by hand has made the choice the filters exist to make unattended.
