@@ -209,6 +209,22 @@ torrent_dir = "/downloads/.torrents"
 # loses it.
 xmlrpc_url = "unix:/config/.local/share/rtorrent/rtorrent.sock"
 
+# Tags built from the captures in your announce regex, written to `d.custom1`.
+#
+# rTorrent has no category of its own: d.custom1 is the single label field, and
+# it is what Flood and ruTorrent both show as tags. Flood asks for it in its
+# ordinary torrent-list call, so nothing needs configuring to see these — and
+# they are encoded exactly as Flood encodes them, so a tag set here is
+# indistinguishable from one you set in the UI.
+#
+# Commas separate tags, so a capture with `split = ","` expands into a list. A
+# comma *inside* a value is encoded rather than treated as a separator.
+#
+# A placeholder naming a group your regex does not declare is a startup error.
+# Setting this overwrites whatever tags the torrent already has.
+#
+# tags_template = "{category},{uploader}"
+
 # qBittorrent instead — put this block first, or delete the rTorrent one.
 #
 # [[clients]]

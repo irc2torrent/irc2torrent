@@ -252,7 +252,7 @@ impl Irc2Torrent {
 
             let client = match clients {
                 TorrentClientOption::rTorrent(ref mut c) => {
-                    rTorrent::new(c.xmlrpc_url.clone()).await.map(TorrentClientsEnum::Rtorrent)
+                    rTorrent::new(c).await.map(TorrentClientsEnum::Rtorrent)
                 }
                 TorrentClientOption::Flood(ref mut c) => {
                     Flood::new(

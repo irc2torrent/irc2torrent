@@ -248,8 +248,26 @@ Templates are parsed when the client is built, so a malformed one is a startup e
 surprise on the first add — and a placeholder naming a group your regex does not declare is rejected
 the same way the filters are.
 
-> rTorrent is not covered: it can carry arbitrary `d.custom` keys, but they are invisible unless
-> Flood or ruTorrent is separately configured to read them, so the payoff did not justify it.
+### Tagging in rTorrent
+
+rTorrent has no category of its own — `d.custom1` is the single label field, and it is what Flood and
+ruTorrent both display as tags:
+
+```toml
+[clients.rTorrent]
+xmlrpc_url    = "unix:/config/.local/share/rtorrent/rtorrent.sock"
+tags_template = "{category},{uploader}"
+```
+
+**Nothing needs configuring to see these.** Flood asks for `d.custom1` in its ordinary torrent-list
+call, and values are encoded exactly as Flood encodes them — trimmed, `encodeURIComponent`d,
+deduplicated, comma-joined — so a tag set here is indistinguishable from one you set in the UI. A
+comma *inside* a value is encoded rather than read as a separator.
+
+Two things to know: setting this **overwrites** whatever tags the torrent already has, and a failure
+to write them is logged but never fails the add — by that point the torrent is loaded and
+downloading, so reporting a failed add would be a lie. That is the same treatment the `addtime`
+stamp already gets.
 
 And two on the tracker block:
 

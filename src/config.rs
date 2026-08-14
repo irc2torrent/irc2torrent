@@ -233,18 +233,27 @@ pub mod config {
         // that can never resolve would otherwise render empty forever -- a tag
         // that silently stops appearing rather than a startup error.
         for client in clients {
-            if let TorrentClientOption::QBittorrent(q) = client {
-                for (template, which) in [
-                    (&q.tags_template, "tags_template"),
-                    (&q.category_template, "category_template"),
-                ] {
-                    if template.trim().is_empty() {
-                        continue;
-                    }
-                    let at = format!("[clients.qBittorrent] {which}");
-                    for name in TextTemplate::parse(template, &at)?.placeholder_names() {
-                        check(name, &at)?;
-                    }
+            let templates: Vec<(&str, String)> = match client {
+                TorrentClientOption::QBittorrent(q) => vec![
+                    (q.tags_template.as_str(), "[clients.qBittorrent] tags_template".into()),
+                    (
+                        q.category_template.as_str(),
+                        "[clients.qBittorrent] category_template".into(),
+                    ),
+                ],
+                TorrentClientOption::rTorrent(r) => vec![(
+                    r.tags_template.as_str(),
+                    "[clients.rTorrent] tags_template".into(),
+                )],
+                TorrentClientOption::Flood(_) => Vec::new(),
+            };
+
+            for (template, at) in templates {
+                if template.trim().is_empty() {
+                    continue;
+                }
+                for name in TextTemplate::parse(template, &at)?.placeholder_names() {
+                    check(name, &at)?;
                 }
             }
         }
@@ -986,6 +995,17 @@ pub mod config {
 
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     pub struct rTorrentOptions {
+        /// Tags built from captured fields, written to `d.custom1`.
+        ///
+        /// rTorrent has no category of its own -- `d.custom1` is the one label
+        /// field, and it is what Flood and ruTorrent both show as tags. Flood
+        /// asks for it in its ordinary torrent-list call, so nothing needs
+        /// configuring to see these.
+        ///
+        /// Values are encoded exactly as Flood encodes them, so a tag set here
+        /// is indistinguishable from one set in the UI.
+        #[serde(default)]
+        pub(crate) tags_template: String,
         pub xmlrpc_url: String,
     }
 
@@ -997,6 +1017,7 @@ pub mod config {
                 // path would come out as `/.local/share/rtorrent/rtorrent.sock`.
                 // See the_unix_socket_url_must_not_use_a_double_slash below.
                 xmlrpc_url: "unix:/config/.local/share/rtorrent/rtorrent.sock".to_string(),
+                tags_template: String::new(),
             }
         }
     }
@@ -2335,6 +2356,22 @@ pub mod config {
             };
             let err = err.to_string();
             assert!(err.contains("tags_template"), "{err}");
+            assert!(err.contains("uploader"), "{err}");
+        }
+
+        #[test]
+        fn an_rtorrent_template_naming_no_capture_is_rejected() {
+            let mut data = data_with(r"(?P<name>.+) /torrent/(?P<id>\d+)", vec![], vec![]);
+            data.clients = vec![TorrentClientOption::rTorrent(rTorrentOptions {
+                tags_template: "{uploader}".to_string(),
+                ..rTorrentOptions::default()
+            })];
+
+            let Err(err) = LoadedOptions::from_data(data) else {
+                panic!("an rTorrent tags_template naming no capture must be rejected");
+            };
+            let err = err.to_string();
+            assert!(err.contains("[clients.rTorrent] tags_template"), "{err}");
             assert!(err.contains("uploader"), "{err}");
         }
 

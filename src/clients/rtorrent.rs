@@ -15,11 +15,18 @@ use log::{error, info};
 use dxr::{DxrError, TryFromValue, Value};
 use dxr_client::{Call, Client, ClientBuilder, ClientError, Url};
 
+use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
+
 use crate::announce::Announce;
+use crate::config::config::rTorrentOptions;
+use crate::template::TextTemplate;
 use crate::clients::{CompletionRow, DownloadResult, TorrentInfo};
 
 pub struct rTorrent {
     client: Client,
+    /// Compiled once. `clients` needs a restart to change, so this inherits
+    /// that documented behaviour.
+    tags_template: Option<TextTemplate>,
 }
 
 /// An integer from rTorrent, whichever width its XML-RPC backend chose to send.
@@ -227,6 +234,29 @@ impl rTorrent {
                             error!("Could not set the added time for {name}: {e:?}");
                         }
                     }
+
+                    // Tags, into the same custom-field mechanism. rTorrent has
+                    // no category of its own: `d.custom1` is the single label
+                    // field, and Flood asks for it in its ordinary torrent-list
+                    // call, so this shows up with nothing else configured.
+                    if let Some(template) = &self.tags_template {
+                        let rendered = template.render(announce);
+                        let encoded = encode_tags(rendered.split(','));
+                        if !encoded.is_empty() {
+                            let tag = Call::new(
+                                "d.custom.set",
+                                (the_hash.clone(), "custom1", encoded.clone()),
+                            );
+                            match self.client.call::<_, RpcInt>(tag).await {
+                                Ok(_) => info!("Tags set for {name} ({the_hash}): {encoded}"),
+                                // Non-fatal for the same reason as above: the
+                                // torrent is already loaded, and reporting a
+                                // failed add would be a lie.
+                                Err(e) => error!("Could not set tags for {name}: {e:?}"),
+                            }
+                        }
+                    }
+
                     Ok(())
                 }
                 Err(e) => {
@@ -244,20 +274,120 @@ impl rTorrent {
 }
 
 impl rTorrent {
-    pub async fn new(url: String) -> Result<rTorrent, Error> {
-        let url = Url::parse(&url)?;
+    pub async fn new(options: &rTorrentOptions) -> Result<rTorrent, Error> {
+        let url = Url::parse(&options.xmlrpc_url)?;
         let client = ClientBuilder::new(url)
             .user_agent("dxr-client-example")
             // .basic_auth(username, Some(password))
             .build();
-        Ok(Self { client })
+
+        // Parsed here so a malformed template is a startup error rather than a
+        // surprise on the first add, matching the qBittorrent client.
+        let tags_template = if options.tags_template.trim().is_empty() {
+            None
+        } else {
+            Some(TextTemplate::parse(
+                &options.tags_template,
+                "[clients.rTorrent] tags_template",
+            )?)
+        };
+
+        Ok(Self { client, tags_template })
     }
+}
+
+/// Everything `encodeURIComponent` leaves alone: `A-Za-z0-9 - _ . ! ~ * ' ( )`.
+///
+/// Matching it exactly is not required -- `decodeURIComponent` unescapes
+/// whatever it is given, so encoding *more* would still round-trip -- but
+/// matching keeps `d.custom1` byte-identical to what Flood itself writes, which
+/// is what makes a tag set here indistinguishable from one set in the UI.
+const JS_URI_COMPONENT: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'_')
+    .remove(b'.')
+    .remove(b'!')
+    .remove(b'~')
+    .remove(b'*')
+    .remove(b'\'')
+    .remove(b'(')
+    .remove(b')');
+
+/// Encode tags the way Flood does, so it can read them back.
+///
+/// Flood's contract, from `server/services/rTorrent/util/torrentPropertiesUtil.ts`
+/// and `constants/methodCallConfigs/torrentList.ts`: trim each tag,
+/// `encodeURIComponent` it, drop empties and duplicates, join with `,`. Reading
+/// is the mirror -- split on `,`, `decodeURIComponent` each element -- which is
+/// why the comma must be encoded inside a tag rather than left to be read as a
+/// separator.
+///
+/// The same convention ruTorrent uses, and Flood asks for `d.custom1` in its
+/// ordinary torrent-list call, so nothing has to be configured to see these.
+fn encode_tags<'a>(tags: impl IntoIterator<Item = &'a str>) -> String {
+    let mut seen: Vec<String> = Vec::new();
+    for tag in tags {
+        let encoded = utf8_percent_encode(tag.trim(), JS_URI_COMPONENT).to_string();
+        if !encoded.is_empty() && !seen.contains(&encoded) {
+            seen.push(encoded);
+        }
+    }
+    seen.join(",")
+}
+
+/// The tag encoder, tested on its own: the module below does
+/// `use tokio::test`, which shadows `#[test]` and would make these async
+/// for no reason.
+#[cfg(test)]
+mod encode_test {
+    use super::encode_tags;
+
+
+        /// Flood splits `d.custom1` on `,` and `decodeURIComponent`s each element
+        /// (`constants/methodCallConfigs/torrentList.ts`), so a comma inside a tag
+        /// has to be encoded or it reads back as two tags.
+        #[test]
+        fn tags_are_encoded_the_way_flood_reads_them() {
+            assert_eq!(encode_tags(["Movies", "4K"]), "Movies,4K");
+            assert_eq!(encode_tags(["Movies :: 4K"]), "Movies%20%3A%3A%204K");
+            assert_eq!(encode_tags(["a,b"]), "a%2Cb", "a comma must not become a separator");
+        }
+
+        #[test]
+        fn tags_are_trimmed_deduplicated_and_emptied_out() {
+            // Matching encodeTags in torrentPropertiesUtil.ts, which trims, drops
+            // empties and skips duplicates before joining.
+            assert_eq!(encode_tags([" hd ", "hd", "", "  ", "remux"]), "hd,remux");
+            assert_eq!(encode_tags([""]), "");
+        }
+
+        /// The set `encodeURIComponent` leaves alone. Encoding more would still
+        /// round-trip, but matching keeps our `d.custom1` byte-identical to one
+        /// Flood wrote itself.
+        #[test]
+        fn the_unreserved_set_matches_encodeuricomponent() {
+            let unreserved = "AZaz09-_.!~*'()";
+            assert_eq!(encode_tags([unreserved]), unreserved);
+            // And the things it does escape, which a release name is full of.
+            assert_eq!(encode_tags(["a b"]), "a%20b");
+            assert_eq!(encode_tags(["a/b"]), "a%2Fb");
+        }
 }
 
 //tests
 #[cfg(test)]
 pub mod test {
     use crate::announce::Announce;
+    use crate::config::config::rTorrentOptions;
+
+    /// Options pointing at the live test socket, with no tags configured.
+    fn sock_options() -> rTorrentOptions {
+        rTorrentOptions {
+            xmlrpc_url: format!("unix:{}", get_sock_addr()),
+            tags_template: String::new(),
+        }
+    }
+
     use std::fs;
     use std::os::unix::prelude::{FileTypeExt, PermissionsExt};
     use tokio::test;
@@ -294,7 +424,7 @@ pub mod test {
     pub async fn an_rpc_int_parses_a_live_rtorrent_integer() {
         use dxr_client::Call;
 
-        let rt = rTorrent::new(format!("unix:{}", get_sock_addr())).await.unwrap();
+        let rt = rTorrent::new(&sock_options()).await.unwrap();
         let pid: RpcInt = rt.client.call(Call::new("system.pid", ())).await.unwrap();
         assert!(pid.0 > 0, "system.pid should be positive, got {pid:?}");
 
@@ -317,7 +447,7 @@ pub mod test {
         } else {
             panic!("The socket file is not accessible or permissions are incorrect.");
         }
-        let mut rt = rTorrent::new(format!("unix:{}", get_sock_addr()).to_string()).await.unwrap();
+        let mut rt = rTorrent::new(&sock_options()).await.unwrap();
         let announce = Announce::new(
             "Diners.Drive-Ins.and.Dives.S48E04.1080p.WEB.h264-FREQUENCY".to_string(),
             "1".to_string(),
@@ -335,7 +465,7 @@ pub mod test {
         } else {
             panic!("The socket file is not accessible or permissions are incorrect.");
         }
-        let mut rt = rTorrent::new(format!("unix:{}", get_sock_addr()).to_string()).await.unwrap();
+        let mut rt = rTorrent::new(&sock_options()).await.unwrap();
         let r = rt.get_dl_list().await;
         println!("Download List: {:?}", r);
     }
