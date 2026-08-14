@@ -36,6 +36,9 @@ pub mod config {
         announce_regex: Regex,
         dl_regexes: Vec<Regex>,
         reject_regexes: Vec<Regex>,
+        /// `data.field_filters` compiled, in the map's sorted order so the
+        /// first rule to veto is the same one every time.
+        field_filters: Vec<(String, CompiledFieldFilter)>,
     }
 
     impl LoadedOptions {
@@ -62,7 +65,37 @@ pub mod config {
 
             // Before the platform check but after the regexes, matching the
             // ordering rationale below: this one is also about a regex field.
-            validate_announce_captures(&announce_regex, &data.captures)?;
+            validate_announce_captures(
+                &announce_regex,
+                &data.captures,
+                &data.require_fields,
+                &data.field_filters,
+            )?;
+
+            let field_filters = data
+                .field_filters
+                .iter()
+                .map(|(field, f)| {
+                    let compile = |p: &Option<String>, which: &str| -> Result<Option<Regex>, Error> {
+                        p.as_deref()
+                            .map(|p| {
+                                Regex::new(p).map_err(|e| {
+                                    Error::msg(format!(
+                                        "field_filters.{field}.{which} is not a valid regex: {e}"
+                                    ))
+                                })
+                            })
+                            .transpose()
+                    };
+                    Ok((
+                        field.clone(),
+                        CompiledFieldFilter {
+                            matches: compile(&f.matches, "matches")?,
+                            reject_matching: compile(&f.reject_matching, "reject_matching")?,
+                        },
+                    ))
+                })
+                .collect::<Result<Vec<_>, Error>>()?;
 
             // After the regexes, so the three tests that assert on regex field
             // names keep getting the regex error rather than this one.
@@ -72,7 +105,7 @@ pub mod config {
             // `UrlTemplate::placeholder_names`.
             validate_platform(&data.platform, &announce_regex)?;
 
-            Ok(Self { data, announce_regex, dl_regexes, reject_regexes })
+            Ok(Self { data, announce_regex, dl_regexes, reject_regexes, field_filters })
         }
     }
 
@@ -86,6 +119,8 @@ pub mod config {
     fn validate_announce_captures(
         re: &Regex,
         captures: &BTreeMap<String, CaptureOptions>,
+        require_fields: &[String],
+        field_filters: &BTreeMap<String, FieldFilter>,
     ) -> Result<(), Error> {
         let declared: Vec<&str> = re.capture_names().flatten().collect();
 
@@ -120,6 +155,29 @@ pub mod config {
                     declared.join(", ")
                 )));
             }
+        }
+
+        // A filter naming a group that does not exist is the worst failure this
+        // feature can produce: `require_fields = ["freelech"]` skips every
+        // release, which looks exactly like a dead announce channel rather than
+        // a typo. Never let it start.
+        let check = |field: &str, where_: &str| -> Result<(), Error> {
+            if declared.contains(&field) {
+                return Ok(());
+            }
+            Err(Error::msg(format!(
+                "options.toml: {where_} names `{field}`, which is not a capture group in \
+                 regex_for_announce_match.\n\
+                 That regex declares: {}\n\
+                 A filter on a field that can never appear would skip every release.",
+                declared.join(", ")
+            )))
+        };
+        for field in require_fields {
+            check(field, "require_fields")?;
+        }
+        for field in field_filters.keys() {
+            check(field, &format!("[field_filters.{field}]"))?;
         }
 
         // A warning rather than an error: `file` and `key` are supplied by the
@@ -320,6 +378,13 @@ pub mod config {
         regex_for_downloads_match: Vec<String>,
         regex_for_downloads_reject_match: Vec<String>,
         regex_for_announce_match: String,
+        /// Captures that must have participated, or the release is skipped.
+        ///
+        /// The whole of "only take freeleech" is `require_fields =
+        /// ["freeleech"]`, given a `(?P<freeleech>...)?` group. An array rather
+        /// than a table, so it sits with the scalars above the tables below.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        require_fields: Vec<String>,
         /// Per-capture handling for the optional groups in the announce regex.
         ///
         /// A table, so it must sit with the other tables below rather than
@@ -328,6 +393,14 @@ pub mod config {
         /// set it -- see `update_option_file`.
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         captures: BTreeMap<String, CaptureOptions>,
+        /// Per-field value rules, as `[field_filters.<capture>]`.
+        ///
+        /// Separate from `regex_for_downloads_match`, which matches the release
+        /// name: these match one named field, and run only after the name lists
+        /// have already said yes -- so the "your reject list ate a match"
+        /// warning keeps meaning what it says.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        field_filters: BTreeMap<String, FieldFilter>,
         /// Absent in configs written before notifications existed, so it must
         /// default rather than fail the whole parse and take the bot down on
         /// upgrade.
@@ -343,6 +416,39 @@ pub mod config {
         telegram: Option<TelegramOptions>,
         #[serde(default)]
         slack: Option<SlackOptions>,
+    }
+
+    /// A value rule for one captured field.
+    ///
+    /// Both patterns are matched against the field's *values*, so a capture
+    /// with `[captures.<n>].split` set is tested per element -- one tag out of
+    /// a list is enough for either rule to fire.
+    #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+    #[serde(default)]
+    pub struct FieldFilter {
+        /// Take it only if some value matches.
+        ///
+        /// An absent field never matches, so this rejects it -- there is
+        /// nothing to test against.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub matches: Option<String>,
+        /// Drop it if some value matches.
+        ///
+        /// An absent field passes, for the same reason inverted: a rule about
+        /// what a value looks like cannot fire on a value that is not there.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub reject_matching: Option<String>,
+    }
+
+    /// `FieldFilter` with its patterns compiled, held in `LoadedOptions`.
+    ///
+    /// Same reason the other three regex lists are compiled once: these run per
+    /// announcement, and a bad pattern must be a config error rather than a
+    /// panic mid-message.
+    #[derive(Debug, Clone)]
+    pub struct CompiledFieldFilter {
+        pub matches: Option<Regex>,
+        pub reject_matching: Option<Regex>,
     }
 
     fn default_true_role() -> bool {
@@ -461,7 +567,9 @@ pub mod config {
                 // particular network: every tracker announces differently, so
                 // this is the field a user always has to write themselves.
                 regex_for_announce_match: r".*Name:'(?P<name>.*)' uploaded by.*https://tracker\.example\.org/torrent/(?P<id>\d+)".to_string(),
+                require_fields: Vec::new(),
                 captures: BTreeMap::new(),
+                field_filters: BTreeMap::new(),
                 notifications: NotificationOptions::default(),
                 telegram: None,
                 slack: None,
@@ -1399,6 +1507,14 @@ pub mod config {
             self.option_data.lock().unwrap().data.captures.clone()
         }
 
+        pub fn get_require_fields(&self) -> Vec<String> {
+            self.option_data.lock().unwrap().data.require_fields.clone()
+        }
+
+        pub fn get_field_filters(&self) -> Vec<(String, CompiledFieldFilter)> {
+            self.option_data.lock().unwrap().field_filters.clone()
+        }
+
         pub fn get_dl_regexes(&self) -> Vec<Regex> {
             self.option_data.lock().unwrap().dl_regexes.clone()
         }
@@ -1857,6 +1973,98 @@ pub mod config {
                 .insert("tags".to_string(), CaptureOptions { split: Some(",".to_string()) });
 
             assert!(LoadedOptions::from_data(data).is_ok());
+        }
+
+        /// The worst failure this feature can produce, and the reason the check
+        /// is an error rather than a warning: a misspelt field is never on any
+        /// announce line, so every release is skipped and the bot looks like it
+        /// has lost the channel.
+        #[test]
+        fn a_require_fields_typo_is_rejected_rather_than_skipping_everything() {
+            let mut data = data_with(
+                r"(?P<name>.+) (?P<freeleech>free)? /torrent/(?P<id>\d+)",
+                vec![],
+                vec![],
+            );
+            data.require_fields = vec!["freelech".to_string()];
+
+            let Err(err) = LoadedOptions::from_data(data) else {
+                panic!("require_fields naming no capture must be rejected");
+            };
+            let err = err.to_string();
+            assert!(err.contains("require_fields"), "{err}");
+            assert!(err.contains("freelech"), "{err}");
+            assert!(err.contains("skip every release"), "should say why: {err}");
+        }
+
+        #[test]
+        fn require_fields_naming_a_declared_capture_loads() {
+            let mut data = data_with(
+                r"(?P<name>.+)(?P<freeleech> free)? /torrent/(?P<id>\d+)",
+                vec![],
+                vec![],
+            );
+            data.require_fields = vec!["freeleech".to_string()];
+            assert!(LoadedOptions::from_data(data).is_ok());
+        }
+
+        #[test]
+        fn a_field_filter_naming_no_capture_is_rejected() {
+            let mut data = data_with(r"(?P<name>.+) /torrent/(?P<id>\d+)", vec![], vec![]);
+            data.field_filters.insert(
+                "categry".to_string(),
+                FieldFilter { matches: Some("^Movies$".to_string()), reject_matching: None },
+            );
+
+            let Err(err) = LoadedOptions::from_data(data) else {
+                panic!("a field filter naming no capture must be rejected");
+            };
+            assert!(err.to_string().contains("field_filters.categry"), "{err}");
+        }
+
+        #[test]
+        fn an_invalid_field_filter_regex_is_rejected() {
+            let mut data = data_with(
+                r"(?P<name>.+) (?P<category>\w+) /torrent/(?P<id>\d+)",
+                vec![],
+                vec![],
+            );
+            data.field_filters.insert(
+                "category".to_string(),
+                FieldFilter { matches: Some("(unclosed".to_string()), reject_matching: None },
+            );
+
+            let Err(err) = LoadedOptions::from_data(data) else {
+                panic!("an invalid field filter regex must be rejected");
+            };
+            assert!(err.to_string().contains("field_filters.category.matches"), "{err}");
+        }
+
+        #[test]
+        fn field_rules_are_absent_from_a_config_that_does_not_use_them() {
+            let text = toml::to_string_pretty(&OptionData::default()).unwrap();
+            assert!(!text.contains("require_fields"), "{text}");
+            assert!(!text.contains("[field_filters"), "{text}");
+        }
+
+        #[test]
+        fn a_config_with_field_rules_round_trips() {
+            let mut data = option_data_for_test();
+            data.regex_for_announce_match =
+                r"(?P<name>.+) (?P<category>\w+)(?P<freeleech> free)? /torrent/(?P<id>\d+)"
+                    .to_string();
+            data.require_fields = vec!["freeleech".to_string()];
+            data.field_filters.insert(
+                "category".to_string(),
+                FieldFilter {
+                    matches: Some("^Movies$".to_string()),
+                    reject_matching: Some("^XXX$".to_string()),
+                },
+            );
+
+            let text = toml::to_string_pretty(&data).unwrap();
+            let back: OptionData = toml::from_str(&text).expect("round trip");
+            assert_eq!(back, data, "rendered as:\n{text}");
         }
 
         #[test]

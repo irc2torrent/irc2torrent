@@ -12,7 +12,7 @@ pub mod torrent {
 
     use crate::announce::Announce;
     use crate::clients::{DownloadResult, TorrentClientsEnum, TorrentInfo};
-    use crate::config::config::Config;
+    use crate::config::config::{CompiledFieldFilter, Config};
     use crate::notify::{Event, Notifier};
     use crate::platforms::http::HttpTracker;
     use crate::platforms::TorrentPlatform;
@@ -34,6 +34,9 @@ pub mod torrent {
         Wanted,
         NotWanted,
         Rejected,
+        /// Wanted by name, vetoed by a field rule. Carries its own description
+        /// because the caller reports it verbatim.
+        FieldRejected(String),
     }
 
     /// What the filters decided, and which pattern decided it.
@@ -54,22 +57,95 @@ pub mod torrent {
             overrode: Option<&'a str>,
         },
         NotWanted,
+        /// A captured field vetoed a release the name lists had already wanted.
+        FieldRejected {
+            field: &'a str,
+            why: FieldVeto<'a>,
+        },
+    }
+
+    /// Why a field rule vetoed a release.
+    #[derive(Debug, PartialEq)]
+    enum FieldVeto<'a> {
+        /// Named in `require_fields`, but the capture did not participate.
+        Absent,
+        /// `matches` is set and no value matched it. An absent field lands here
+        /// too: there is nothing to test, so it cannot pass.
+        NoValueMatched(&'a str),
+        /// `reject_matching` hit one of the values.
+        RejectedBy(&'a str),
+    }
+
+    impl std::fmt::Display for FieldVeto<'_> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                FieldVeto::Absent => write!(f, "it is not on the announce line"),
+                FieldVeto::NoValueMatched(p) => write!(f, "no value matches '{p}'"),
+                FieldVeto::RejectedBy(p) => write!(f, "a value matches '{p}'"),
+            }
+        }
     }
 
     /// Reject wins over match, as it always has. The download list is consulted
     /// afterwards only to explain *why*, and only once a reject has already
     /// hit -- so the ordinary path costs exactly what it did before.
-    fn decide<'a>(name: &str, dl: &'a [Regex], reject: &'a [Regex]) -> Decision<'a> {
+    ///
+    /// Field rules run last, as a veto over a release the name lists already
+    /// wanted. Ordering them that way keeps `Rejected { overrode }` meaning
+    /// exactly what it did -- "your reject list ate something you asked for" --
+    /// rather than becoming a second, differently-shaped rejection source.
+    fn decide<'a>(
+        announce: &Announce,
+        dl: &'a [Regex],
+        reject: &'a [Regex],
+        require_fields: &'a [String],
+        field_filters: &'a [(String, CompiledFieldFilter)],
+    ) -> Decision<'a> {
+        let name = announce.name.as_str();
+
         if let Some(r) = reject.iter().find(|r| r.is_match(name)) {
             return Decision::Rejected {
                 by: r.as_str(),
                 overrode: dl.iter().find(|d| d.is_match(name)).map(Regex::as_str),
             };
         }
-        match dl.iter().find(|d| d.is_match(name)) {
-            Some(d) => Decision::Wanted(d.as_str()),
-            None => Decision::NotWanted,
+        let wanted = match dl.iter().find(|d| d.is_match(name)) {
+            Some(d) => d.as_str(),
+            None => return Decision::NotWanted,
+        };
+
+        for field in require_fields {
+            if !announce.has(field) {
+                return Decision::FieldRejected { field, why: FieldVeto::Absent };
+            }
         }
+
+        for (field, filter) in field_filters {
+            // `values` is per-element for a split capture and a single element
+            // otherwise, so one tag out of a list is enough either way. It is
+            // empty for an absent field, which is what gives the two rules
+            // their opposite answers below.
+            let values = announce.values(field);
+
+            if let Some(re) = &filter.matches {
+                if !values.iter().any(|v| re.is_match(v)) {
+                    return Decision::FieldRejected {
+                        field,
+                        why: FieldVeto::NoValueMatched(re.as_str()),
+                    };
+                }
+            }
+            if let Some(re) = &filter.reject_matching {
+                if values.iter().any(|v| re.is_match(v)) {
+                    return Decision::FieldRejected {
+                        field,
+                        why: FieldVeto::RejectedBy(re.as_str()),
+                    };
+                }
+            }
+        }
+
+        Decision::Wanted(wanted)
     }
 
     /// Why a torrent is being considered, which decides whether the download
@@ -107,6 +183,11 @@ pub mod torrent {
         NotWanted,
         /// Matched `regex_for_downloads_reject_match`.
         Rejected,
+        /// Matched by name, then vetoed by `require_fields` or a
+        /// `[field_filters.*]` rule. Deliberately not folded into `Rejected`,
+        /// whose message names `regex_for_downloads_reject_match` and would be
+        /// pointing at the wrong setting.
+        FieldRejected(String),
         DownloadFailed(String),
         AddFailed(String),
     }
@@ -122,6 +203,7 @@ pub mod torrent {
                 TorrentOutcome::Rejected => {
                     write!(f, "Ignored: the name matches regex_for_downloads_reject_match.")
                 }
+                TorrentOutcome::FieldRejected(why) => write!(f, "Ignored: {why}"),
                 TorrentOutcome::DownloadFailed(e) => {
                     write!(f, "Could not download the torrent file: {e}")
                 }
@@ -167,10 +249,11 @@ pub mod torrent {
         ) -> TorrentOutcome {
             let name = announce.name.as_str();
             if trigger.consults_filters() {
-                match self.do_we_want_this_torrent(name) {
+                match self.do_we_want_this_torrent(announce) {
                     Filter::Wanted => {}
                     Filter::NotWanted => return TorrentOutcome::NotWanted,
                     Filter::Rejected => return TorrentOutcome::Rejected,
+                    Filter::FieldRejected(why) => return TorrentOutcome::FieldRejected(why),
                 }
             } else {
                 info!("Adding '{name}' on request; download filters do not apply.");
@@ -211,11 +294,20 @@ pub mod torrent {
             }
         }
 
-        pub fn do_we_want_this_torrent(&self, name: &str) -> Filter {
+        pub fn do_we_want_this_torrent(&self, announce: &Announce) -> Filter {
+            let name = announce.name.as_str();
             let dl_regexes = self.options.borrow().get_dl_regexes();
             let reject_regexes = self.options.borrow().get_reject_regexes();
+            let require_fields = self.options.borrow().get_require_fields();
+            let field_filters = self.options.borrow().get_field_filters();
 
-            match decide(name, &dl_regexes, &reject_regexes) {
+            match decide(
+                announce,
+                &dl_regexes,
+                &reject_regexes,
+                &require_fields,
+                &field_filters,
+            ) {
                 // The case worth interrupting someone for: a pattern the user
                 // wrote to catch this release did catch it, and a reject pattern
                 // threw it away anyway. Either they meant that, or a reject
@@ -246,6 +338,14 @@ pub mod torrent {
                 Decision::Wanted(pattern) => {
                     info!("Torrent '{name}' matched '{pattern}'");
                     Filter::Wanted
+                }
+                // Its own arm rather than folding into Rejected: the name
+                // matched, so pointing at regex_for_downloads_reject_match
+                // would send someone to the wrong setting.
+                Decision::FieldRejected { field, why } => {
+                    let reason = format!("`{field}` vetoed it: {why}");
+                    info!("Torrent '{name}' wanted by name, but {reason}");
+                    Filter::FieldRejected(reason)
                 }
                 // Silent before, which left a filtered-out torrent looking
                 // exactly like a broken client.
@@ -409,6 +509,12 @@ pub mod torrent {
             patterns.iter().map(|p| Regex::new(p).unwrap()).collect()
         }
 
+        /// `decide` with no field rules and a synthetic announce, so the
+        /// pre-existing name-list cases below read exactly as they did.
+        fn decide_by_name<'a>(name: &str, dl: &'a [Regex], reject: &'a [Regex]) -> Decision<'a> {
+            decide(&Announce::new(name.to_string(), "1".to_string()), dl, reject, &[], &[])
+        }
+
         /// The distinction the warning exists for: a release the user's own
         /// match list asked for, thrown away by a reject pattern.
         #[test]
@@ -416,7 +522,7 @@ pub mod torrent {
             let dl = regexes(&[".*2160p.*"]);
             let reject = regexes(&["(?i).*GERMAN.*"]);
             assert_eq!(
-                decide("Some.Release.2160p.GERMAN.WEB", &dl, &reject),
+                decide_by_name("Some.Release.2160p.GERMAN.WEB", &dl, &reject),
                 Decision::Rejected { by: "(?i).*GERMAN.*", overrode: Some(".*2160p.*") }
             );
         }
@@ -428,7 +534,7 @@ pub mod torrent {
             let dl = regexes(&[".*2160p.*"]);
             let reject = regexes(&["(?i).*GERMAN.*"]);
             assert_eq!(
-                decide("Some.Release.1080p.GERMAN.WEB", &dl, &reject),
+                decide_by_name("Some.Release.1080p.GERMAN.WEB", &dl, &reject),
                 Decision::Rejected { by: "(?i).*GERMAN.*", overrode: None }
             );
         }
@@ -440,7 +546,7 @@ pub mod torrent {
             let dl = regexes(&[".*2160p.*"]);
             let reject = regexes(&["(?i).*GERMAN.*"]);
             assert!(matches!(
-                decide("Some.Release.2160p.GERMAN.WEB", &dl, &reject),
+                decide_by_name("Some.Release.2160p.GERMAN.WEB", &dl, &reject),
                 Decision::Rejected { .. }
             ));
         }
@@ -449,7 +555,7 @@ pub mod torrent {
         fn a_plain_match_names_the_pattern_that_matched() {
             let dl = regexes(&[".*1080p.*", ".*2160p.*"]);
             assert_eq!(
-                decide("Some.Release.2160p.WEB", &dl, &[]),
+                decide_by_name("Some.Release.2160p.WEB", &dl, &[]),
                 Decision::Wanted(".*2160p.*")
             );
         }
@@ -458,7 +564,158 @@ pub mod torrent {
         fn matching_nothing_is_not_wanted() {
             let dl = regexes(&[".*2160p.*"]);
             let reject = regexes(&["(?i).*GERMAN.*"]);
-            assert_eq!(decide("Some.Release.720p.WEB", &dl, &reject), Decision::NotWanted);
+            assert_eq!(decide_by_name("Some.Release.720p.WEB", &dl, &reject), Decision::NotWanted);
+        }
+
+        // ---- field rules -------------------------------------------------
+
+        /// An announce carrying the given fields, matched by `.*2160p.*` below.
+        fn announce_with(fields: &[(&str, &str)]) -> Announce {
+            let names: Vec<String> = fields.iter().map(|(k, _)| (*k).to_string()).collect();
+            let pattern = format!(
+                r"(?P<name>[^|]+)\|{}\|(?P<id>\d+)",
+                names
+                    .iter()
+                    .map(|n| format!("(?P<{n}>[^|]*)"))
+                    .collect::<Vec<_>>()
+                    .join(r"\|")
+            );
+            let re = Regex::new(&pattern).unwrap();
+            let subject = format!(
+                "Some.Release.2160p.WEB|{}|7",
+                fields.iter().map(|(_, v)| *v).collect::<Vec<_>>().join("|")
+            );
+            let caps = re.captures(&subject).expect("fixture should match");
+            Announce::from_captures(&re, &caps, &Default::default()).unwrap()
+        }
+
+        fn filter(matches: Option<&str>, reject_matching: Option<&str>) -> CompiledFieldFilter {
+            CompiledFieldFilter {
+                matches: matches.map(|p| Regex::new(p).unwrap()),
+                reject_matching: reject_matching.map(|p| Regex::new(p).unwrap()),
+            }
+        }
+
+        #[test]
+        fn a_required_field_that_is_present_passes() {
+            let dl = regexes(&[".*2160p.*"]);
+            let a = announce_with(&[("freeleech", "freeleech")]);
+            let require = vec!["freeleech".to_string()];
+            assert_eq!(
+                decide(&a, &dl, &[], &require, &[]),
+                Decision::Wanted(".*2160p.*")
+            );
+        }
+
+        #[test]
+        fn a_required_field_that_did_not_capture_vetoes_it() {
+            // The motivating case: only take freeleech releases.
+            let dl = regexes(&[".*2160p.*"]);
+            let a = Announce::new("Some.Release.2160p.WEB".to_string(), "7".to_string());
+            let require = vec!["freeleech".to_string()];
+            assert_eq!(
+                decide(&a, &dl, &[], &require, &[]),
+                Decision::FieldRejected { field: "freeleech", why: FieldVeto::Absent }
+            );
+        }
+
+        #[test]
+        fn field_rules_run_only_after_the_name_lists_agree() {
+            // A release nothing asked for is NotWanted, not FieldRejected --
+            // otherwise every unwanted release would be reported as a field
+            // problem.
+            let dl = regexes(&[".*2160p.*"]);
+            let a = Announce::new("Some.Release.720p.WEB".to_string(), "7".to_string());
+            let require = vec!["freeleech".to_string()];
+            assert_eq!(decide(&a, &dl, &[], &require, &[]), Decision::NotWanted);
+        }
+
+        #[test]
+        fn a_reject_pattern_still_wins_over_a_field_rule() {
+            let dl = regexes(&[".*2160p.*"]);
+            let reject = regexes(&["(?i).*GERMAN.*"]);
+            let a = announce_with(&[("freeleech", "freeleech")]);
+            let a = Announce::new(format!("{}.GERMAN", a.name), "7".to_string());
+            assert!(matches!(
+                decide(&a, &dl, &reject, &[], &[]),
+                Decision::Rejected { .. }
+            ));
+        }
+
+        #[test]
+        fn matches_takes_only_what_it_names() {
+            let dl = regexes(&[".*2160p.*"]);
+            let rules = vec![("category".to_string(), filter(Some("^Movies$"), None))];
+
+            let movie = announce_with(&[("category", "Movies")]);
+            assert_eq!(decide(&movie, &dl, &[], &[], &rules), Decision::Wanted(".*2160p.*"));
+
+            let tv = announce_with(&[("category", "TV")]);
+            assert_eq!(
+                decide(&tv, &dl, &[], &[], &rules),
+                Decision::FieldRejected {
+                    field: "category",
+                    why: FieldVeto::NoValueMatched("^Movies$")
+                }
+            );
+        }
+
+        #[test]
+        fn reject_matching_drops_what_it_names() {
+            let dl = regexes(&[".*2160p.*"]);
+            let rules = vec![("uploader".to_string(), filter(None, Some("^(?i)anonymous$")))];
+
+            let named = announce_with(&[("uploader", "j3rico")]);
+            assert_eq!(decide(&named, &dl, &[], &[], &rules), Decision::Wanted(".*2160p.*"));
+
+            let anon = announce_with(&[("uploader", "Anonymous")]);
+            assert!(matches!(
+                decide(&anon, &dl, &[], &[], &rules),
+                Decision::FieldRejected { field: "uploader", why: FieldVeto::RejectedBy(_) }
+            ));
+        }
+
+        /// The two rules answer an absent field oppositely, and neither answer
+        /// is obvious -- so both are pinned here rather than left to be
+        /// rediscovered from the implementation.
+        #[test]
+        fn an_absent_field_fails_matches_and_passes_reject_matching() {
+            let dl = regexes(&[".*2160p.*"]);
+            let a = Announce::new("Some.Release.2160p.WEB".to_string(), "7".to_string());
+
+            // Nothing to test against, so it cannot pass.
+            let rules = vec![("category".to_string(), filter(Some("^Movies$"), None))];
+            assert!(matches!(
+                decide(&a, &dl, &[], &[], &rules),
+                Decision::FieldRejected { .. }
+            ));
+
+            // A rule about what a value looks like cannot fire on no value.
+            let rules = vec![("category".to_string(), filter(None, Some("^TV$")))];
+            assert_eq!(decide(&a, &dl, &[], &[], &rules), Decision::Wanted(".*2160p.*"));
+        }
+
+        #[test]
+        fn a_split_field_is_tested_per_value() {
+            use crate::announce::CaptureOptions;
+            let mut options = std::collections::BTreeMap::new();
+            options.insert("tags".to_string(), CaptureOptions { split: Some(",".to_string()) });
+
+            let re = Regex::new(r"(?P<name>[^|]+)\|(?P<tags>[^|]*)\|(?P<id>\d+)").unwrap();
+            let caps = re.captures("Some.Release.2160p.WEB|hd, remux, dv|7").unwrap();
+            let a = Announce::from_captures(&re, &caps, &options).unwrap();
+
+            let dl = regexes(&[".*2160p.*"]);
+
+            // One element matching is enough for either rule.
+            let rules = vec![("tags".to_string(), filter(Some("^remux$"), None))];
+            assert_eq!(decide(&a, &dl, &[], &[], &rules), Decision::Wanted(".*2160p.*"));
+
+            let rules = vec![("tags".to_string(), filter(None, Some("^dv$")))];
+            assert!(matches!(
+                decide(&a, &dl, &[], &[], &rules),
+                Decision::FieldRejected { .. }
+            ));
         }
     }
 }

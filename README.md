@@ -167,11 +167,45 @@ sub-values like `category`/`subcategory` are better written as two groups. Namin
 that the regex does not declare is a startup error, because the alternative is a field that
 silently never appears.
 
-Captured fields can be used in [`download_url_template`](#configuration) straight away — a tracker
-whose download URL needs an `authkey` from the announce line just names the group and uses
-`{authkey}`.
+Captured fields can be used in [`download_url_template`](#configuration) — a tracker whose download
+URL needs an `authkey` from the announce line just names the group and uses `{authkey}`.
 
-> Filtering on these fields and passing them to the client as tags land next.
+### Filtering on those fields
+
+**"Only take freeleech" is one line**, given a `(?P<freeleech>...)?` group:
+
+```toml
+require_fields = ["freeleech"]
+```
+
+Every field named must have captured, or the release is skipped. For value rules:
+
+```toml
+[field_filters.category]
+matches = "^Movies$"
+
+[field_filters.uploader]
+reject_matching = "^(?i)anonymous$"
+```
+
+Both patterns test the field's *values*, so a capture with a `split` is tested per element — one tag
+out of a list is enough for either rule to fire.
+
+These run **after** `regex_for_downloads_match` has already said yes, so they narrow what you asked
+for rather than widening it. A release nothing asked for is still reported as "not wanted", and the
+"your reject list ate a match" warning keeps meaning exactly what it says.
+
+An absent field answers the two rules oppositely, and neither answer is arbitrary: `matches` rejects
+it, since there is nothing to match against; `reject_matching` passes it, since a rule about what a
+value looks like cannot fire on a value that is not there. Use `require_fields` for presence.
+
+Naming a field your regex does not declare is a **startup error** — a typo would otherwise skip
+every release and look exactly like a dead announce channel.
+
+`cmd:addtorrent` bypasses all of this, as it already did for the name filters: someone who names a
+torrent by hand has made the choice the filters exist to make unattended.
+
+> Passing these fields to the client as tags lands next.
 
 And two on the tracker block:
 

@@ -64,8 +64,43 @@ regex_for_announce_match = '''.*Name:'(?P<name>.*)' uploaded by.*https://tracker
 #   * `file` and `key` are reserved for download_url_template and are ignored
 #     if you name a capture after them. You get a warning, not an error.
 #
-# Nothing consumes these fields yet -- that lands next. Declaring them now is
-# harmless and saves editing the regex again later.
+# Use them in download_url_template below, and to filter -- see the two
+# sections that follow.
+
+# ---------------------------------------------------------------------------
+# Filtering on captured fields
+# ---------------------------------------------------------------------------
+#
+# These run only AFTER regex_for_downloads_match has already said yes, so they
+# narrow what you asked for rather than widening it. A release nothing asked
+# for is still just "not wanted"; these never make it look like a field problem.
+#
+# Every field named here must be a group your regex declares -- a typo would
+# otherwise skip every release and look exactly like a dead announce channel,
+# so it is a startup error.
+
+# Fields that must have captured, or the release is skipped. The whole of
+# "only take freeleech" is one line, given a `(?P<freeleech>...)?` group:
+#
+# require_fields = ["freeleech"]
+
+# ---------------------------------------------------------------------------
+# Per-field value rules
+# ---------------------------------------------------------------------------
+#
+# Both patterns test the field's VALUES, so a capture with a `split` set is
+# tested per element -- one tag out of a list is enough for either to fire.
+#
+# An absent field answers the two oppositely, and neither answer is arbitrary:
+# `matches` rejects it (there is nothing to match against) while
+# `reject_matching` passes it (a rule about what a value looks like cannot fire
+# on a value that is not there). Use require_fields if you want presence.
+#
+# [field_filters.category]
+# matches = "^Movies$"
+#
+# [field_filters.uploader]
+# reject_matching = "^(?i)anonymous$"
 
 # ---------------------------------------------------------------------------
 # Splitting a capture into several values
