@@ -222,7 +222,34 @@ otherwise skip every release and look exactly like a dead announce channel.
 `cmd:addtorrent` bypasses all of this, as it already did for the name filters: someone who names a
 torrent by hand has made the choice the filters exist to make unattended.
 
-> Passing these fields to the client as tags lands next.
+### Tagging in qBittorrent
+
+Captured fields can become qBittorrent tags and a category:
+
+```toml
+[clients.qBittorrent]
+url               = "http://127.0.0.1:8080"
+tags_template     = "{category},{uploader}"
+category_template = "{category}"
+```
+
+qBittorrent's tags are comma-separated, and a capture with `split` expands straight back into a list
+— so `tags_template = "{tags}"` over a `split = ","` capture round-trips.
+
+A placeholder whose capture did not fire renders empty and the field is simply not sent, so a
+release with no `uploader` gets one fewer tag rather than a blank one. `category_template` overrides
+the fixed `category` only when it renders to something, so that stays the fallback.
+
+Values are stripped of CR/LF and capped at 128 characters before being sent — they come off an IRC
+announce line, and the request body is multipart, so an unfiltered value would be header injection
+into the bot's own request.
+
+Templates are parsed when the client is built, so a malformed one is a startup error rather than a
+surprise on the first add — and a placeholder naming a group your regex does not declare is rejected
+the same way the filters are.
+
+> rTorrent is not covered: it can carry arbitrary `d.custom` keys, but they are invisible unless
+> Flood or ruTorrent is separately configured to read them, so the payoff did not justify it.
 
 And two on the tracker block:
 

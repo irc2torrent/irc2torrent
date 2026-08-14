@@ -227,6 +227,20 @@ xmlrpc_url = "unix:/config/.local/share/rtorrent/rtorrent.sock"
 # Empty means whatever qBittorrent is already configured to use.
 # save_path = ""
 # category  = ""
+#
+# Tags and category built from the captures in your announce regex. qBittorrent
+# tags are comma-separated, and a capture with `split` set expands straight back
+# into a list -- so "{tags}" over a `split = ","` capture round-trips.
+#
+# A placeholder whose capture did not fire renders empty and the field is simply
+# not sent, so a release with no uploader gets one fewer tag rather than a blank
+# one. category_template overrides `category` above only when it renders to
+# something, so the fixed value stays the fallback.
+#
+# A placeholder naming a group your regex does not declare is a startup error.
+#
+# tags_template     = "{category},{uploader}"
+# category_template = "{category}"
 
 # ---------------------------------------------------------------------------
 # Commands over IRC

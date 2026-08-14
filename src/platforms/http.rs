@@ -9,7 +9,8 @@ use tokio::io::AsyncWriteExt;
 
 use crate::announce::Announce;
 use crate::config::config::PlatformOptions;
-use crate::platforms::url_template::{FieldSource, UrlTemplate};
+use crate::platforms::url_template::UrlTemplate;
+use crate::template::FieldSource;
 use crate::platforms::TorrentPlatform;
 
 /// Longest filename we will produce, leaving room for the ".torrent" suffix on

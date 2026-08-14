@@ -26,6 +26,8 @@ use anyhow::Error;
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use reqwest::Url;
 
+use crate::template::{lex, FieldSource, Part};
+
 /// RFC 3986 "unreserved": `ALPHA / DIGIT / "-" / "." / "_" / "~"`.
 ///
 /// Everything else is escaped, which is what makes a substituted value unable to
@@ -45,10 +47,6 @@ pub(crate) const RESERVED: [&str; 2] = ["file", "key"];
 
 const PLACEHOLDER_HELP: &str = "`{file}` and `{key}` are always available; any other placeholder \
      must name a capture group in regex_for_announce_match";
-
-/// Longest placeholder name accepted. Generous for a capture name, short
-/// enough that an error message stays readable.
-const MAX_NAME: usize = 64;
 
 /// Stand-in prefix used only while validating the template.
 const PROBE_PREFIX: &str = "qqzzprobe";
@@ -79,50 +77,6 @@ fn probe_prefix_for(literals: &str) -> String {
         prefix.insert(1, 'q');
     }
     prefix
-}
-
-/// Restrict names to what a regex capture name can be.
-///
-/// A subset of what `regex` accepts, which is what lets the config layer treat
-/// "is this placeholder declared" as plain set containment rather than a fuzzy
-/// comparison.
-fn check_name(name: &str) -> Result<(), Error> {
-    if name.is_empty() {
-        return Err(Error::msg(format!(
-            "download_url_template has an empty placeholder `{{}}`; {PLACEHOLDER_HELP}"
-        )));
-    }
-    if name.len() > MAX_NAME {
-        return Err(Error::msg(format!(
-            "download_url_template has a placeholder name longer than {MAX_NAME} characters"
-        )));
-    }
-    if let Some(c) = name.chars().find(|c| !c.is_ascii_alphanumeric() && *c != '_') {
-        return Err(Error::msg(format!(
-            "download_url_template placeholder `{{{name}}}` contains {c:?}; names may use \
-             letters, digits and underscore only"
-        )));
-    }
-    Ok(())
-}
-
-#[derive(Debug)]
-enum Part {
-    Literal(String),
-    /// Index into `UrlTemplate::names`, so a name is stored once however often
-    /// it is used.
-    Field(usize),
-}
-
-/// Where `render` looks up a placeholder's value.
-///
-/// A trait rather than a fixed struct because the set of placeholders is now
-/// whatever the user's announce regex declares. Returning `None` is a hard
-/// error in `render`: the config layer has already proved every placeholder is
-/// either reserved or a declared capture, so a miss here means that proof was
-/// bypassed, and refusing the download is the safe answer.
-pub(crate) trait FieldSource {
-    fn get(&self, name: &str) -> Option<&str>;
 }
 
 #[derive(Debug)]
@@ -159,7 +113,7 @@ impl UrlTemplate {
             )));
         }
 
-        let (parts, names) = lex(template)?;
+        let (parts, names) = lex(template, "download_url_template")?;
         let uses_key = names.iter().any(|n| n == "key");
 
         // Probes are generated against the template's literal text so they
@@ -295,74 +249,11 @@ impl UrlTemplate {
     }
 }
 
-/// Split a template into literals and placeholders.
-///
-/// `{{` and `}}` are literal braces, so a tracker whose URLs genuinely contain
-/// one is still expressible.
-fn lex(template: &str) -> Result<(Vec<Part>, Vec<String>), Error> {
-    let mut parts = Vec::new();
-    let mut names: Vec<String> = Vec::new();
-    let mut literal = String::new();
-    let mut chars = template.chars().peekable();
-
-    while let Some(c) = chars.next() {
-        match c {
-            '{' if chars.peek() == Some(&'{') => {
-                chars.next();
-                literal.push('{');
-            }
-            '}' if chars.peek() == Some(&'}') => {
-                chars.next();
-                literal.push('}');
-            }
-            '}' => {
-                return Err(Error::msg(
-                    "download_url_template has a `}` with no matching `{`; \
-                     write `}}` for a literal brace",
-                ))
-            }
-            '{' => {
-                let mut name = String::new();
-                let mut closed = false;
-                for c in chars.by_ref() {
-                    if c == '}' {
-                        closed = true;
-                        break;
-                    }
-                    name.push(c);
-                }
-                if !closed {
-                    return Err(Error::msg(format!(
-                        "download_url_template has an unterminated `{{{name}`. {PLACEHOLDER_HELP}"
-                    )));
-                }
-                check_name(&name)?;
-                // Interned, so `/{id}/x/{id}` carries one name and one probe.
-                let idx = match names.iter().position(|n| *n == name) {
-                    Some(i) => i,
-                    None => {
-                        names.push(name);
-                        names.len() - 1
-                    }
-                };
-                if !literal.is_empty() {
-                    parts.push(Part::Literal(std::mem::take(&mut literal)));
-                }
-                parts.push(Part::Field(idx));
-            }
-            _ => literal.push(c),
-        }
-    }
-
-    if !literal.is_empty() {
-        parts.push(Part::Literal(literal));
-    }
-    Ok((parts, names))
-}
 
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::template::MAX_NAME;
 
     const TPL: &str = "https://tracker.example.org/rss/download/{id}/{key}/{file}";
 

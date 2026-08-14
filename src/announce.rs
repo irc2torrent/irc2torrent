@@ -167,6 +167,21 @@ impl Announce {
     }
 }
 
+/// So an `Announce` can be substituted into a text template directly.
+///
+/// The download URL deliberately does *not* use this: it needs `file` and `key`
+/// answered before the announce is consulted, which `DownloadFields` in
+/// `platforms::http` does instead.
+impl crate::template::FieldSource for Announce {
+    fn get(&self, name: &str) -> Option<&str> {
+        Announce::get(self, name)
+    }
+
+    fn values(&self, name: &str) -> Vec<&str> {
+        Announce::values(self, name).iter().map(String::as_str).collect()
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;

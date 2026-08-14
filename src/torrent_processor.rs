@@ -311,7 +311,7 @@ pub mod torrent {
                 }
             };
 
-            match self.add_torrent_and_start(b64, name.to_string()).await {
+            match self.add_torrent_and_start(b64, announce).await {
                 Ok(_) => {
                     info!("Torrent added to client.");
                     self.notifier.send(Event::TorrentAdded(name.to_string()));
@@ -410,11 +410,17 @@ pub mod torrent {
             }
         }
 
-        pub async fn add_torrent_and_start(&self, file: String, name: String) -> Result<(), Error> {
+        pub async fn add_torrent_and_start(
+            &self,
+            file: String,
+            announce: &Announce,
+        ) -> Result<(), Error> {
             match &self.torrent_client {
-                TorrentClientsEnum::Rtorrent(c) => c.add_torrent_and_start(&file, name).await,
-                TorrentClientsEnum::Flood(c) => c.add_torrent_and_start(&file, name).await,
-                TorrentClientsEnum::QBittorrent(c) => c.add_torrent_and_start(&file, name).await,
+                TorrentClientsEnum::Rtorrent(c) => c.add_torrent_and_start(&file, announce).await,
+                TorrentClientsEnum::Flood(c) => c.add_torrent_and_start(&file, announce).await,
+                TorrentClientsEnum::QBittorrent(c) => {
+                    c.add_torrent_and_start(&file, announce).await
+                }
             }
         }
 

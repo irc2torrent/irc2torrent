@@ -17,6 +17,7 @@ use tokio::select;
 use tokio::time::{Duration, Instant, interval_at};
 
 mod announce;
+mod template;
 mod irc_processor;
 mod command_processor;
 mod torrent_processor;
@@ -264,13 +265,7 @@ impl Irc2Torrent {
                         .map(TorrentClientsEnum::Flood)
                 }
                 TorrentClientOption::QBittorrent(ref mut c) => {
-                    QBittorrent::new(
-                        c.url.clone(),
-                        c.username.clone(),
-                        c.password.clone(),
-                        c.save_path.clone(),
-                        c.category.clone(),
-                    )
+                    QBittorrent::new(c)
                         .await
                         .map(TorrentClientsEnum::QBittorrent)
                 }

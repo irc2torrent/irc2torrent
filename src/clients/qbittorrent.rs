@@ -26,7 +26,10 @@ use reqwest::StatusCode;
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::announce::Announce;
 use crate::clients::{CompletionRow, TorrentInfo, Unrecoverable};
+use crate::config::config::QBittorrentOptions;
+use crate::template::TextTemplate;
 
 /// Long enough for a slow client on a busy NAS, short enough that a half-open
 /// connection does not take the bot down with it.
@@ -51,6 +54,10 @@ pub struct QBittorrent {
     save_path: String,
     /// Empty means no category.
     category: String,
+    /// Compiled once here rather than per add, and `clients` already needs a
+    /// restart to change, so they inherit that documented behaviour.
+    tags_template: Option<TextTemplate>,
+    category_template: Option<TextTemplate>,
     /// The WebAPI version as reported once at construction, e.g. `2.11.0`.
     ///
     /// Cached rather than asked per call: it decides the name of one form field
@@ -74,14 +81,8 @@ impl std::fmt::Debug for QBittorrent {
 }
 
 impl QBittorrent {
-    pub async fn new(
-        url: String,
-        username: String,
-        password: String,
-        save_path: String,
-        category: String,
-    ) -> Result<QBittorrent, Error> {
-        let url = url.trim().trim_end_matches('/').to_string();
+    pub async fn new(options: &QBittorrentOptions) -> Result<QBittorrent, Error> {
+        let url = options.url.trim().trim_end_matches('/').to_string();
         if url.is_empty() {
             return Err(Unrecoverable("[clients.qBittorrent] needs a `url`".into()).into());
         }
@@ -97,13 +98,28 @@ impl QBittorrent {
             .build()
             .map_err(|e| Error::msg(format!("Could not build the qBittorrent client: {e}")))?;
 
+        // Parsed here so a malformed template is a startup error rather than a
+        // surprise on the first add. Empty means "not configured", which is
+        // distinct from a template that renders empty.
+        let compile = |t: &str, what: &str| -> Result<Option<TextTemplate>, Error> {
+            if t.trim().is_empty() {
+                return Ok(None);
+            }
+            TextTemplate::parse(t, what).map(Some)
+        };
+
         let mut qbt = Self {
             client,
             url,
-            username,
-            password,
-            save_path,
-            category,
+            username: options.username.clone(),
+            password: options.password.clone(),
+            save_path: options.save_path.clone(),
+            category: options.category.clone(),
+            tags_template: compile(&options.tags_template, "[clients.qBittorrent] tags_template")?,
+            category_template: compile(
+                &options.category_template,
+                "[clients.qBittorrent] category_template",
+            )?,
             api_version: String::new(),
         };
 
@@ -282,8 +298,9 @@ impl QBittorrent {
     pub(crate) async fn add_torrent_and_start(
         &self,
         file: &str,
-        name: String,
+        announce: &Announce,
     ) -> Result<(), Error> {
+        let name = announce.name.clone();
         let bytes = general_purpose::STANDARD
             .decode(file.as_bytes())
             .map_err(|_| Error::msg("The torrent file was not valid base64"))?;
@@ -307,12 +324,37 @@ impl QBittorrent {
             "paused"
         };
 
+        // Rendered before the field list is built so the strings outlive it.
+        // An empty render means "nothing to say", not "set it to empty": a
+        // release with no `uploader` capture gets one fewer tag rather than a
+        // blank one, matching how the fixed `category` behaves.
+        let tags = self
+            .tags_template
+            .as_ref()
+            .map(|t| sanitize_field(&t.render(announce)))
+            .unwrap_or_default();
+        let rendered_category = self
+            .category_template
+            .as_ref()
+            .map(|t| sanitize_field(&t.render(announce)))
+            .unwrap_or_default();
+
         let mut fields: Vec<(&str, &str)> = vec![(start_field, "false")];
         if !self.save_path.is_empty() {
             fields.push(("savepath", &self.save_path));
         }
-        if !self.category.is_empty() {
-            fields.push(("category", &self.category));
+        // The template wins when it produced something, so the fixed value is
+        // the fallback for releases whose captures did not fire.
+        let category = if rendered_category.is_empty() {
+            self.category.as_str()
+        } else {
+            rendered_category.as_str()
+        };
+        if !category.is_empty() {
+            fields.push(("category", category));
+        }
+        if !tags.is_empty() {
+            fields.push(("tags", &tags));
         }
 
         let boundary = format!(
@@ -494,6 +536,25 @@ fn api_at_least(version: &str, major: u32, minor: u32) -> bool {
 /// this crate does not enable and which would pull `mime_guess` and `unicase`
 /// into a dependency tree the manifest is deliberately strict about. Being a
 /// plain `Vec<u8>` also makes it cheap to rebuild for the re-auth retry.
+/// Longest field value sent. Generous for a tag list, short enough that a
+/// pathological release name cannot bloat the request.
+const MAX_FIELD_LEN: usize = 128;
+
+/// Make a rendered value safe to put in a multipart field.
+///
+/// `multipart_body` writes values verbatim, and these are built from an IRC
+/// announce line -- the same reason the torrent filename below is a constant.
+/// The boundary is 128 bits of `fastrand`, so part injection is not a practical
+/// worry, but "cannot inject" should be structural rather than probabilistic.
+fn sanitize_field(value: &str) -> String {
+    let cleaned: String = value.chars().filter(|c| *c != '\r' && *c != '\n').collect();
+    match cleaned.char_indices().nth(MAX_FIELD_LEN) {
+        // Truncate on a char boundary, not a byte one.
+        Some((byte, _)) => cleaned[..byte].to_string(),
+        None => cleaned,
+    }
+}
+
 fn multipart_body(boundary: &str, torrent: &[u8], fields: &[(&str, &str)]) -> Vec<u8> {
     let mut body: Vec<u8> = Vec::with_capacity(torrent.len() + 512);
 
@@ -680,6 +741,76 @@ mod test {
         assert!(text.contains("filename=\"torrent\""), "{text}");
     }
 
+    /// Tag values are built from an IRC announce line, so they reach
+    /// `multipart_body` from the same untrusted place the release name does.
+    #[test]
+    fn a_field_value_cannot_carry_crlf_into_a_mime_header() {
+        let hostile = "Movies\r\nContent-Disposition: form-data; name=\"savepath\"\r\n\r\n/etc";
+        let cleaned = sanitize_field(hostile);
+        assert!(!cleaned.contains('\r') && !cleaned.contains('\n'), "{cleaned:?}");
+
+        let body = multipart_body("BOUND", b"d8:announce4:teste", &[("tags", &cleaned)]);
+        let text = String::from_utf8_lossy(&body);
+
+        // The injected text survives as *text* -- that is fine and expected.
+        // What matters is that it cannot become a header, which takes the CRLF
+        // that is no longer there. Counting the delimiter, not the words.
+        assert_eq!(
+            text.matches("\r\nContent-Disposition").count(),
+            2,
+            "only the tags part and the file part are headers:\n{text}"
+        );
+        assert_eq!(
+            text.matches("\r\nContent-Disposition: form-data; name=\"savepath\"").count(),
+            0,
+            "the injected header must not be a real one:\n{text}"
+        );
+    }
+
+    #[test]
+    fn a_field_value_is_capped_on_a_char_boundary() {
+        // Multi-byte on purpose: truncating by bytes would split one.
+        let long = "é".repeat(MAX_FIELD_LEN + 50);
+        let cleaned = sanitize_field(&long);
+        assert_eq!(cleaned.chars().count(), MAX_FIELD_LEN);
+        assert!(cleaned.is_char_boundary(cleaned.len()));
+    }
+
+    #[test]
+    fn tags_and_category_are_rendered_from_captured_fields() {
+        let re = regex::Regex::new(
+            r"(?P<name>[^|]+)\|(?P<category>[^|]+)\|(?P<uploader>[^|]+)\|(?P<id>\d+)",
+        )
+        .unwrap();
+        let caps = re.captures("Some.Release|Movies|j3rico|7").unwrap();
+        let announce =
+            Announce::from_captures(&re, &caps, &Default::default()).unwrap();
+
+        let tags = TextTemplate::parse("{category},{uploader}", "tags_template").unwrap();
+        assert_eq!(sanitize_field(&tags.render(&announce)), "Movies,j3rico");
+
+        let category = TextTemplate::parse("{category}", "category_template").unwrap();
+        assert_eq!(sanitize_field(&category.render(&announce)), "Movies");
+    }
+
+    #[test]
+    fn a_template_whose_fields_are_absent_renders_nothing_to_send() {
+        // An empty render means the field is omitted entirely, so a release
+        // without the capture gets one fewer tag rather than a blank one.
+        let announce = named("Some.Release");
+        let tags = TextTemplate::parse("{uploader}", "tags_template").unwrap();
+        assert!(sanitize_field(&tags.render(&announce)).is_empty());
+    }
+
+    #[test]
+    fn a_malformed_template_is_rejected_when_the_client_is_built() {
+        let mut o = opts("http://127.0.0.1:1".into(), String::new(), String::new(), String::new());
+        o.tags_template = "{a-b}".into();
+        // Fails on the template before any network call is attempted.
+        let err = futures::executor::block_on(QBittorrent::new(&o)).unwrap_err().to_string();
+        assert!(err.contains("tags_template"), "{err}");
+    }
+
     #[test]
     fn the_multipart_body_carries_the_torrent_bytes_verbatim() {
         let bytes = b"d8:announce4:test4:infod6:lengthi1ee e";
@@ -739,6 +870,25 @@ mod test {
         String::from_utf8_lossy(request).to_string()
     }
 
+    /// Options for the constructor, which takes the whole struct rather than
+    /// seven positional strings.
+    fn opts(url: String, username: String, password: String, category: String) -> QBittorrentOptions {
+        QBittorrentOptions {
+            url,
+            username,
+            password,
+            save_path: String::new(),
+            category,
+            tags_template: String::new(),
+            category_template: String::new(),
+        }
+    }
+
+    /// The announce an add is made from, when the test only cares about a name.
+    fn named(name: &str) -> Announce {
+        Announce::new(name.to_string(), "1".to_string())
+    }
+
     /// A client that skips `new()`, so a test can pin the API version rather
     /// than having to serve a probe first.
     fn client_against(base: &str, api_version: &str) -> QBittorrent {
@@ -749,6 +899,8 @@ mod test {
             password: "hunter2".into(),
             save_path: String::new(),
             category: String::new(),
+            tags_template: None,
+            category_template: None,
             api_version: api_version.to_string(),
         }
     }
@@ -808,7 +960,7 @@ mod test {
     async fn no_login_happens_when_the_api_answers_unauthenticated() {
         let (base, server) = fake_api(vec![(200, "2.11.0")]).await;
 
-        let qbt = QBittorrent::new(base.clone(), String::new(), String::new(), String::new(), String::new())
+        let qbt = QBittorrent::new(&opts(base.clone(), String::new(), String::new(), String::new()))
             .await
             .expect("an unauthenticated server should just work");
         assert_eq!(qbt.api_version, "2.11.0");
@@ -825,7 +977,7 @@ mod test {
         let (base, server) =
             fake_api(vec![(403, "Unauthorized"), (200, "Ok."), (200, "2.11.0")]).await;
 
-        QBittorrent::new(base, "user".into(), "pw".into(), String::new(), String::new())
+        QBittorrent::new(&opts(base, "user".into(), "pw".into(), String::new()))
             .await
             .expect("login then retry should succeed");
 
@@ -885,7 +1037,7 @@ mod test {
         let (base, server) = fake_api(vec![(200, "Ok.")]).await;
 
         client_against(&base, "2.11.0")
-            .add_torrent_and_start(&a_torrent_b64(), "Some Release".into())
+            .add_torrent_and_start(&a_torrent_b64(), &named("Some Release"))
             .await
             .unwrap();
 
@@ -908,7 +1060,7 @@ mod test {
         {
             let (base, server) = fake_api(vec![(200, "Ok.")]).await;
             client_against(&base, version)
-                .add_torrent_and_start(&a_torrent_b64(), "R".into())
+                .add_torrent_and_start(&a_torrent_b64(), &named("R"))
                 .await
                 .unwrap();
 
@@ -937,7 +1089,7 @@ mod test {
         ] {
             let (base, _server) = fake_api(vec![(200, body)]).await;
             client_against(&base, "2.11.0")
-                .add_torrent_and_start(&a_torrent_b64(), "R".into())
+                .add_torrent_and_start(&a_torrent_b64(), &named("R"))
                 .await
                 .unwrap_or_else(|e| panic!("{body} should be success: {e}"));
         }
@@ -949,7 +1101,7 @@ mod test {
         for body in [r#"{"added_torrent_ids":[]}"#, "Fails."] {
             let (base, _server) = fake_api(vec![(200, body)]).await;
             let err = client_against(&base, "2.11.0")
-                .add_torrent_and_start(&a_torrent_b64(), "R".into())
+                .add_torrent_and_start(&a_torrent_b64(), &named("R"))
                 .await
                 .expect_err("{body} must not be treated as success");
             assert!(!err.to_string().is_empty());
@@ -964,7 +1116,7 @@ mod test {
         let (base, _server) = fake_api(vec![(409, "Conflict")]).await;
 
         let err = client_against(&base, "2.11.0")
-            .add_torrent_and_start(&a_torrent_b64(), "R".into())
+            .add_torrent_and_start(&a_torrent_b64(), &named("R"))
             .await
             .expect_err("409 must be an error");
 
@@ -976,7 +1128,7 @@ mod test {
         let (base, _server) = fake_api(vec![(415, "")]).await;
 
         let err = client_against(&base, "2.11.0")
-            .add_torrent_and_start(&a_torrent_b64(), "R".into())
+            .add_torrent_and_start(&a_torrent_b64(), &named("R"))
             .await
             .expect_err("415 must be an error");
 
@@ -991,7 +1143,7 @@ mod test {
         let html = general_purpose::STANDARD.encode("<html>Please log in</html>");
 
         let err = client_against(&base, "2.11.0")
-            .add_torrent_and_start(&html, "Some Release".into())
+            .add_torrent_and_start(&html, &named("Some Release"))
             .await
             .expect_err("not a torrent");
 
@@ -1005,7 +1157,7 @@ mod test {
     async fn bad_credentials_are_fatal_and_named() {
         let (base, _server) = fake_api(vec![(403, "Unauthorized"), (200, "Fails.")]).await;
 
-        let err = QBittorrent::new(base, "user".into(), "wrong".into(), String::new(), String::new())
+        let err = QBittorrent::new(&opts(base, "user".into(), "wrong".into(), String::new()))
             .await
             .expect_err("bad credentials must fail");
 
@@ -1017,7 +1169,7 @@ mod test {
     async fn a_banned_ip_says_so() {
         let (base, _server) = fake_api(vec![(403, "Unauthorized"), (403, "banned")]).await;
 
-        let err = QBittorrent::new(base, "user".into(), "pw".into(), String::new(), String::new())
+        let err = QBittorrent::new(&opts(base, "user".into(), "pw".into(), String::new()))
             .await
             .expect_err("a ban must fail");
 
@@ -1033,7 +1185,7 @@ mod test {
         // reqwest's own Display would have embedded the URL.
         let dead = "http://127.0.0.1:1";
         let unreachable = client_against(dead, "2.11.0")
-            .add_torrent_and_start(&a_torrent_b64(), "R".into())
+            .add_torrent_and_start(&a_torrent_b64(), &named("R"))
             .await
             .expect_err("nothing is listening");
 
@@ -1071,7 +1223,7 @@ mod test {
         let user = std::env::var("QBITTORRENT_TEST_USER").unwrap_or_default();
         let pass = std::env::var("QBITTORRENT_TEST_PASS").unwrap_or_default();
 
-        let qbt = QBittorrent::new(url, user, pass, String::new(), "irc2torrent-test".into())
+        let qbt = QBittorrent::new(&opts(url, user, pass, "irc2torrent-test".into()))
             .await
             .expect("could not reach qBittorrent");
 
@@ -1080,7 +1232,7 @@ mod test {
         // once -- which is how this was written the first time.
         remove_test_torrent(&qbt).await;
 
-        qbt.add_torrent_and_start(&a_torrent_b64(), "test".into())
+        qbt.add_torrent_and_start(&a_torrent_b64(), &named("test"))
             .await
             .expect("add failed");
 

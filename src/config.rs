@@ -16,6 +16,7 @@ pub mod config {
 
     use crate::announce::{CaptureOptions, REQUIRED_NAMES, RESERVED_NAMES};
     use crate::platforms::url_template::{UrlTemplate, RESERVED};
+    use crate::template::TextTemplate;
     use crate::{IRC_CONFIG_FILE, OPTIONS_CONFIG_FILE};
 
     /// How long to wait for a burst of filesystem events to settle before
@@ -125,6 +126,7 @@ pub mod config {
                 &data.require_fields,
                 &data.field_filters,
                 &data.regex_for_downloads_match,
+                &data.clients,
             )?;
 
             let field_filters = compile_filters(&data.field_filters, "field_filters.")?;
@@ -154,6 +156,7 @@ pub mod config {
         require_fields: &[String],
         field_filters: &BTreeMap<String, FieldFilter>,
         watches: &[WatchEntry],
+        clients: &[TorrentClientOption],
     ) -> Result<(), Error> {
         let declared: Vec<&str> = re.capture_names().flatten().collect();
 
@@ -222,6 +225,26 @@ pub mod config {
             if let Some(filters) = entry.field_filters() {
                 for field in filters.keys() {
                     check(field, &format!("{at}: field_filters.{field}"))?;
+                }
+            }
+        }
+
+        // The client's metadata templates get the same treatment. A placeholder
+        // that can never resolve would otherwise render empty forever -- a tag
+        // that silently stops appearing rather than a startup error.
+        for client in clients {
+            if let TorrentClientOption::QBittorrent(q) = client {
+                for (template, which) in [
+                    (&q.tags_template, "tags_template"),
+                    (&q.category_template, "category_template"),
+                ] {
+                    if template.trim().is_empty() {
+                        continue;
+                    }
+                    let at = format!("[clients.qBittorrent] {which}");
+                    for name in TextTemplate::parse(template, &at)?.placeholder_names() {
+                        check(name, &at)?;
+                    }
                 }
             }
         }
@@ -999,6 +1022,20 @@ pub mod config {
         /// Empty means no category.
         #[serde(default)]
         pub(crate) category: String,
+        /// Tags built from captured fields, e.g. `"{category},{uploader}"`.
+        ///
+        /// qBittorrent's `tags` is comma-separated, and a capture with
+        /// `[captures.<n>].split` set expands straight back into a list -- so
+        /// `"{tags}"` over a `split = ","` capture round-trips.
+        ///
+        /// Empty renders are dropped, so a release missing the field simply
+        /// gets one fewer tag rather than a blank one.
+        #[serde(default)]
+        pub(crate) tags_template: String,
+        /// Category built the same way. Overrides `category` when it renders to
+        /// something non-empty, so the fixed value stays the fallback.
+        #[serde(default)]
+        pub(crate) category_template: String,
     }
 
     // Hand-written Debug so the password cannot reach a log via a stray `{:?}`,
@@ -1023,6 +1060,8 @@ pub mod config {
                 password: String::new(),
                 save_path: String::new(),
                 category: String::new(),
+                tags_template: String::new(),
+                category_template: String::new(),
             }
         }
     }
@@ -2281,6 +2320,37 @@ pub mod config {
                 panic!("an invalid entry filter regex must be rejected");
             };
             assert!(err.to_string().contains("Star Trek.*"), "{err}");
+        }
+
+        #[test]
+        fn a_client_template_naming_no_capture_is_rejected() {
+            let mut data = data_with(r"(?P<name>.+) /torrent/(?P<id>\d+)", vec![], vec![]);
+            data.clients = vec![TorrentClientOption::QBittorrent(QBittorrentOptions {
+                tags_template: "{uploader}".to_string(),
+                ..QBittorrentOptions::default()
+            })];
+
+            let Err(err) = LoadedOptions::from_data(data) else {
+                panic!("a tags_template naming no capture must be rejected");
+            };
+            let err = err.to_string();
+            assert!(err.contains("tags_template"), "{err}");
+            assert!(err.contains("uploader"), "{err}");
+        }
+
+        #[test]
+        fn a_client_template_naming_a_declared_capture_loads() {
+            let mut data = data_with(
+                r"(?P<name>.+) (?P<uploader>\w+) /torrent/(?P<id>\d+)",
+                vec![],
+                vec![],
+            );
+            data.clients = vec![TorrentClientOption::QBittorrent(QBittorrentOptions {
+                tags_template: "{uploader}".to_string(),
+                category_template: "{uploader}".to_string(),
+                ..QBittorrentOptions::default()
+            })];
+            assert!(LoadedOptions::from_data(data).is_ok());
         }
 
         #[test]
