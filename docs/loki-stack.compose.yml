@@ -43,7 +43,7 @@ services:
         target: /etc/loki/loki-config.yaml
         mode: 0444
     volumes:
-      - /share/Container/logstack/data/loki:/loki
+      - /share/Loki/logstack/data/loki:/loki
     networks: [logging]
 
   alloy:
@@ -68,7 +68,7 @@ services:
         target: /etc/alloy/config.alloy
         mode: 0444
     volumes:
-      - /share/Container/logstack/data/alloy:/var/lib/alloy/data
+      - /share/Loki/logstack/data/alloy:/var/lib/alloy/data
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - /:/rootfs:ro
       - /sys:/sys:ro
@@ -85,14 +85,14 @@ services:
       # Required. Without it Prometheus rejects Alloy's pushes and vitals
       # silently never arrive.
       - --web.enable-remote-write-receiver
-      - --storage.tsdb.retention.time=30d
+      - --storage.tsdb.retention.time=365d
     # user: "0:0"    # uncomment if chown 65534 did not take
     configs:
       - source: prometheus_config
         target: /etc/prometheus/prometheus.yml
         mode: 0444
     volumes:
-      - /share/Container/logstack/data/prometheus:/prometheus
+      - /share/Loki/logstack/data/prometheus:/prometheus
     networks: [logging]
 
   grafana:
@@ -116,7 +116,7 @@ services:
         target: /etc/grafana/provisioning/datasources/prometheus.yaml
         mode: 0444
     volumes:
-      - /share/Container/logstack/data/grafana:/var/lib/grafana
+      - /share/Loki/logstack/data/grafana:/var/lib/grafana
     depends_on: [loki, prometheus]
     networks: [logging]
 
@@ -182,13 +182,16 @@ configs:
         delete_request_store: filesystem
 
       limits_config:
-        # 30 days -- the thing QNAP's 100 MB cap denies you. Raise or lower
-        # freely; the only cost is disk.
-        retention_period: 720h
+        # 365 days, as 365 x 24 -- Loki takes hours here, not days, so a bare
+        # "365d" is not accepted and "720h" is a month, not a year.
+        #
+        # Raising this never recovers data already deleted: retention runs
+        # continuously in the compactor, it is not evaluated at query time.
+        retention_period: 8760h
         ingestion_rate_mb: 8
         ingestion_burst_size_mb: 16
         # Default 32. Each unit is a goroutine doing real work; 8 stops an
-        # accidental "last 30 days" search pinning every core.
+        # accidental "last 365 days" search pinning every core.
         max_query_parallelism: 8
         volume_enabled: true
 
