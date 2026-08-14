@@ -10,6 +10,7 @@ pub mod torrent {
     use pub_sub::{PubSub, Subscription};
     use regex::Regex;
 
+    use crate::announce::Announce;
     use crate::clients::{DownloadResult, TorrentClientsEnum, TorrentInfo};
     use crate::config::config::Config;
     use crate::notify::{Event, Notifier};
@@ -151,8 +152,8 @@ pub mod torrent {
         }
 
         /// Handle a torrent seen on an announce channel: filters apply.
-        pub async fn process_torrent(&self, name: &String, id: &String) -> TorrentOutcome {
-            self.fetch_and_add(name, id, Trigger::Announcement).await
+        pub async fn process_torrent(&self, announce: &Announce) -> TorrentOutcome {
+            self.fetch_and_add(announce, Trigger::Announcement).await
         }
 
         /// Fetch a torrent and hand it to the client.
@@ -161,10 +162,10 @@ pub mod torrent {
         /// trigger that asks for them.
         async fn fetch_and_add(
             &self,
-            name: &str,
-            id: &str,
+            announce: &Announce,
             trigger: Trigger,
         ) -> TorrentOutcome {
+            let name = announce.name.as_str();
             if trigger.consults_filters() {
                 match self.do_we_want_this_torrent(name) {
                     Filter::Wanted => {}
@@ -175,7 +176,7 @@ pub mod torrent {
                 info!("Adding '{name}' on request; download filters do not apply.");
             }
 
-            let b64 = match self.download_torrent(name.to_string(), id.to_string()).await {
+            let b64 = match self.download_torrent(announce).await {
                 Ok(b64) => {
                     info!("Torrent downloaded.");
                     b64
@@ -283,10 +284,10 @@ pub mod torrent {
             }
         }
 
-        pub async fn download_torrent(&self, name: String, id: String) -> Result<String, Error> {
+        pub async fn download_torrent(&self, announce: &Announce) -> Result<String, Error> {
             // This used to match on a one-variant enum with an `else` arm that
             // reported "Torrent platform not supported" and was unreachable.
-            self.torrent_platform.download_torrent(name, id).await
+            self.torrent_platform.download_torrent(announce).await
         }
 
         /// Add a torrent named by an explicit `addtorrent` command.
@@ -294,13 +295,14 @@ pub mod torrent {
         /// Goes through the same path as an announcement but with
         /// `Trigger::ExplicitCommand`, so the download filters are not consulted
         /// -- an authorized user who names a torrent gets that torrent.
-        pub async fn add_torrent(&self, name: &str, id: &str) -> Result<String, String> {
+        pub async fn add_torrent(&self, announce: &Announce) -> Result<String, String> {
+            let name = announce.name.as_str();
             // Both client arms of the old implementation were
             // `.expect("TODO: panic message")`, so any error killed the bot
             // instead of reaching whoever asked; its download error was
             // discarded the same way, reported as a fixed "Can not download
             // torrent file".
-            match self.fetch_and_add(name, id, Trigger::ExplicitCommand).await {
+            match self.fetch_and_add(announce, Trigger::ExplicitCommand).await {
                 TorrentOutcome::Added => Ok(format!("Torrent {name} added.")),
                 // Unreachable for this trigger, but mapping them keeps the match
                 // exhaustive if another filtered trigger is ever added.

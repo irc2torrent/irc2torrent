@@ -1,4 +1,5 @@
 pub mod config {
+    use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
     use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
@@ -13,6 +14,7 @@ pub mod config {
     use serde_derive::{Deserialize, Serialize};
     use tokio::fs;
 
+    use crate::announce::{CaptureOptions, REQUIRED_NAMES, RESERVED_NAMES};
     use crate::platforms::url_template::UrlTemplate;
     use crate::{IRC_CONFIG_FILE, OPTIONS_CONFIG_FILE};
 
@@ -58,12 +60,79 @@ pub mod config {
                 "regex_for_downloads_reject_match",
             )?;
 
+            // Before the platform check but after the regexes, matching the
+            // ordering rationale below: this one is also about a regex field.
+            validate_announce_captures(&announce_regex, &data.captures)?;
+
             // After the regexes, so the three tests that assert on regex field
             // names keep getting the regex error rather than this one.
             validate_platform(&data.platform)?;
 
             Ok(Self { data, announce_regex, dl_regexes, reject_regexes })
         }
+    }
+
+    /// Reject an announce regex the rest of the crate cannot work with.
+    ///
+    /// `name` and `id` used to be read with `caps["name"]`, which panics on a
+    /// group that is missing *or* did not participate -- inside the IRC read
+    /// loop, so a config typo took the bot down on the first announcement
+    /// instead of at startup. Checking here means both startup and every reload
+    /// are covered, and a running bot survives a bad edit.
+    fn validate_announce_captures(
+        re: &Regex,
+        captures: &BTreeMap<String, CaptureOptions>,
+    ) -> Result<(), Error> {
+        let declared: Vec<&str> = re.capture_names().flatten().collect();
+
+        for required in REQUIRED_NAMES {
+            if !declared.contains(&required) {
+                let found = if declared.is_empty() {
+                    "it declares no named groups at all".to_string()
+                } else {
+                    format!("it declares: {}", declared.join(", "))
+                };
+                return Err(Error::msg(format!(
+                    "options.toml: regex_for_announce_match has no (?P<{required}>...) group -- \
+                     {found}.\n\
+                     Both `name` and `id` are required: `name` is the release, `id` is what the \
+                     download URL is built from. For example:\n\n    \
+                     regex_for_announce_match = '''.*Name:'(?P<name>.*)' uploaded by.*\
+                     /torrent/(?P<id>\\d+)'''\n\n\
+                     Any other named group you add becomes an optional field. See \
+                     docs/options.sample.toml."
+                )));
+            }
+        }
+
+        // A split configured for a group that does not exist is a typo, and a
+        // silent one: the field simply never appears and whatever consumes it
+        // behaves as though the tracker stopped sending it.
+        for name in captures.keys() {
+            if !declared.contains(&name.as_str()) {
+                return Err(Error::msg(format!(
+                    "options.toml: [captures.{name}] does not name a group in \
+                     regex_for_announce_match, which declares: {}",
+                    declared.join(", ")
+                )));
+            }
+        }
+
+        // A warning rather than an error: `file` and `key` are supplied by the
+        // download URL template itself, so a capture with either name is
+        // ignored. Confusing, but not exploitable -- and rejecting it would
+        // break a config where the group happens to be unused.
+        for name in &declared {
+            if RESERVED_NAMES.contains(name) {
+                warn!(
+                    "regex_for_announce_match declares a group named `{name}`, which is reserved \
+                     for download_url_template and will be ignored. Rename it if you meant to use \
+                     it as a field."
+                );
+            }
+        }
+
+        Ok(())
     }
 
     /// Reject a tracker section that cannot actually download anything.
@@ -222,6 +291,14 @@ pub mod config {
         regex_for_downloads_match: Vec<String>,
         regex_for_downloads_reject_match: Vec<String>,
         regex_for_announce_match: String,
+        /// Per-capture handling for the optional groups in the announce regex.
+        ///
+        /// A table, so it must sit with the other tables below rather than
+        /// among the scalars above. Skipped when empty so it never appears in
+        /// the file `cmd:addtowatchlist` rewrites for the many users who do not
+        /// set it -- see `update_option_file`.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        captures: BTreeMap<String, CaptureOptions>,
         /// Absent in configs written before notifications existed, so it must
         /// default rather than fail the whole parse and take the bot down on
         /// upgrade.
@@ -355,6 +432,7 @@ pub mod config {
                 // particular network: every tracker announces differently, so
                 // this is the field a user always has to write themselves.
                 regex_for_announce_match: r".*Name:'(?P<name>.*)' uploaded by.*https://tracker\.example\.org/torrent/(?P<id>\d+)".to_string(),
+                captures: BTreeMap::new(),
                 notifications: NotificationOptions::default(),
                 telegram: None,
                 slack: None,
@@ -1286,6 +1364,12 @@ pub mod config {
             self.option_data.lock().unwrap().announce_regex.clone()
         }
 
+        /// Per-capture handling, paired with `get_announce_regex` at both match
+        /// sites. Usually empty, so the clone is a `BTreeMap::new()`.
+        pub fn get_capture_options(&self) -> BTreeMap<String, CaptureOptions> {
+            self.option_data.lock().unwrap().data.captures.clone()
+        }
+
         pub fn get_dl_regexes(&self) -> Vec<Regex> {
             self.option_data.lock().unwrap().dl_regexes.clone()
         }
@@ -1677,6 +1761,108 @@ pub mod config {
         // `let ... else` rather than expect_err: that would require Debug on
         // LoadedOptions, and the struct holds the whole config -- not something
         // worth making printable just to satisfy a test.
+        /// A valid announce pattern for cases that are not about the announce
+        /// regex. `data_with(".*", ..)` would now be rejected for declaring no
+        /// captures, which would make those tests assert on the wrong error.
+        const VALID_ANNOUNCE: &str = r"(?P<name>.+) /torrent/(?P<id>\d+)";
+
+        #[test]
+        fn an_announce_regex_without_a_name_capture_is_rejected() {
+            let Err(err) =
+                LoadedOptions::from_data(data_with(r"/torrent/(?P<id>\d+)", vec![], vec![]))
+            else {
+                panic!("an announce regex with no `name` group must be rejected");
+            };
+            let err = err.to_string();
+            assert!(err.contains("regex_for_announce_match"), "{err}");
+            assert!(err.contains("(?P<name>"), "should show the shape: {err}");
+            // The error is the only mitigation for a bot that now refuses to
+            // start where it used to panic later, so it must say what *was*
+            // found rather than only what is missing.
+            assert!(err.contains("id"), "should list what was declared: {err}");
+        }
+
+        #[test]
+        fn an_announce_regex_without_an_id_capture_is_rejected() {
+            let Err(err) = LoadedOptions::from_data(data_with(r"(?P<name>.+)", vec![], vec![]))
+            else {
+                panic!("an announce regex with no `id` group must be rejected");
+            };
+            assert!(err.to_string().contains("regex_for_announce_match"), "{err}");
+        }
+
+        #[test]
+        fn an_announce_regex_with_no_named_groups_at_all_says_so() {
+            let Err(err) = LoadedOptions::from_data(data_with(".*", vec![], vec![])) else {
+                panic!("an announce regex with no named groups must be rejected");
+            };
+            assert!(err.to_string().contains("no named groups"), "{err}");
+        }
+
+        #[test]
+        fn a_capture_split_naming_an_undeclared_group_is_rejected() {
+            // The failure this prevents is silent: the field simply never
+            // appears, which looks like the tracker changing its format.
+            let mut data = data_with(VALID_ANNOUNCE, vec![], vec![]);
+            data.captures.insert(
+                "freelech".to_string(),
+                CaptureOptions { split: Some(",".to_string()) },
+            );
+
+            let Err(err) = LoadedOptions::from_data(data) else {
+                panic!("a [captures.*] entry naming no group must be rejected");
+            };
+            let err = err.to_string();
+            assert!(err.contains("captures.freelech"), "{err}");
+            assert!(err.contains("name"), "should list the declared groups: {err}");
+        }
+
+        #[test]
+        fn a_capture_split_naming_a_declared_group_loads() {
+            let mut data = data_with(
+                r"(?P<name>.+) (?P<tags>[^/]+) /torrent/(?P<id>\d+)",
+                vec![],
+                vec![],
+            );
+            data.captures
+                .insert("tags".to_string(), CaptureOptions { split: Some(",".to_string()) });
+
+            assert!(LoadedOptions::from_data(data).is_ok());
+        }
+
+        #[test]
+        fn a_capture_named_key_warns_but_still_loads() {
+            // Reserved-wins makes it confusing, not exploitable, and rejecting
+            // would break a config where the group is merely unused.
+            let data = data_with(
+                r"(?P<name>.+) (?P<key>\w+) /torrent/(?P<id>\d+)",
+                vec![],
+                vec![],
+            );
+            assert!(LoadedOptions::from_data(data).is_ok());
+        }
+
+        #[test]
+        fn captures_are_absent_from_a_config_that_does_not_use_them() {
+            // skip_serializing_if: the file `cmd:addtowatchlist` rewrites must
+            // not sprout an empty table for the many users who never set one.
+            let text = toml::to_string_pretty(&OptionData::default()).unwrap();
+            assert!(!text.contains("[captures"), "{text}");
+        }
+
+        #[test]
+        fn a_config_with_captures_round_trips() {
+            let mut data = option_data_for_test();
+            data.regex_for_announce_match =
+                r"(?P<name>.+) (?P<tags>[^/]+) /torrent/(?P<id>\d+)".to_string();
+            data.captures
+                .insert("tags".to_string(), CaptureOptions { split: Some(", ".to_string()) });
+
+            let text = toml::to_string_pretty(&data).unwrap();
+            let back: OptionData = toml::from_str(&text).expect("round trip");
+            assert_eq!(back, data, "rendered as:\n{text}");
+        }
+
         #[test]
         fn an_invalid_announce_regex_is_rejected() {
             let Err(err) = LoadedOptions::from_data(data_with("(unclosed", vec![], vec![])) else {

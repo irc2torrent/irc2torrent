@@ -134,7 +134,41 @@ Three notes on the regexes:
   `Nordic` and the rest; the sample above collapses five entries into three that way.
 - `regex_for_announce_match` is the field you will actually have to write, since every network
   announces differently. Watch the channel by hand for a minute first, or run with
-  `RUST_LOG=debug` to see raw lines.
+  `RUST_LOG=debug` to see raw lines. `name` and `id` are required and startup fails without
+  them, naming the field — that used to be a panic on the first announcement instead.
+
+### Extra fields from the announce line
+
+**Every other named capture becomes an optional field.** Announce lines usually carry more than a
+name and an id — a category, an uploader, a freeleech marker — and naming a group is all it takes
+to capture it. Nothing about this is tracker-specific, so a network with entirely different
+metadata works the same way:
+
+```toml
+regex_for_announce_match = '''<(?P<category>[^:]+) :: (?P<subcategory>[^>]+)>\s+Name:'(?P<name>.*)' uploaded by '(?P<uploader>[^']+)'(?P<freeleech> freeleech)?.*/torrent/(?P<id>\d+)'''
+```
+
+A group wrapped in `?` is a **marker**: `(?P<freeleech> freeleech)?` captures only when the word is
+on the line, so "is this freeleech" is whether the field is present at all — distinct from a group
+that matched but captured nothing.
+
+`file` and `key` are reserved for `download_url_template`; a capture named after either is ignored
+with a warning rather than an error.
+
+When a single capture holds an unknown number of values, split it:
+
+```toml
+[captures.tags]
+split = ","
+```
+
+Values are trimmed and empty ones dropped. Only worth it when the count is unknown — two fixed
+sub-values like `category`/`subcategory` are better written as two groups. Naming a capture here
+that the regex does not declare is a startup error, because the alternative is a field that
+silently never appears.
+
+> Fields are captured and validated now; the features that consume them — filtering, client tags,
+> URL placeholders — land next. Declaring them early is harmless.
 
 And two on the tracker block:
 

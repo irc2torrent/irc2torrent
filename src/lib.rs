@@ -16,6 +16,7 @@ use crate::torrent_processor::torrent::TorrentProcessor;
 use tokio::select;
 use tokio::time::{Duration, Instant, interval_at};
 
+mod announce;
 mod irc_processor;
 mod command_processor;
 mod torrent_processor;

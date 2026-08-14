@@ -7,6 +7,7 @@ use log::info;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
+use crate::announce::Announce;
 use crate::config::config::PlatformOptions;
 use crate::platforms::url_template::{Fields, UrlTemplate};
 use crate::platforms::TorrentPlatform;
@@ -98,18 +99,19 @@ impl TorrentPlatform for HttpTracker {
         &self.torrent_dir
     }
 
-    async fn download_torrent(&self, name: String, id: String) -> Result<String, Error> {
+    async fn download_torrent(&self, announce: &Announce) -> Result<String, Error> {
+        let (name, id) = (announce.name.as_str(), announce.id.as_str());
         info!("Downloading torrent from {}: {}", self.label, name);
 
-        let torrent_file = sanitize_torrent_filename(&name);
+        let torrent_file = sanitize_torrent_filename(name);
 
         // The rss_key is a secret and the template is user-supplied: never
         // include the URL in an error or log line. `render` percent-encodes each
         // substituted value and re-checks the host, because `name` and `id` come
         // straight off IRC -- see platforms::url_template.
         let url = self.template.render(Fields {
-            id: &id,
-            name: &name,
+            id,
+            name,
             file: &torrent_file,
             key: &self.rss_key,
         })?;

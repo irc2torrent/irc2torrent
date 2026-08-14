@@ -37,7 +37,49 @@ regex_for_downloads_reject_match = [
 # How to pull the release name and torrent id out of an announce line. The two
 # named captures `name` and `id` are required; the rest depends on your
 # network's announce format. This is the one you will have to write yourself.
+#
+# Startup fails if `name` or `id` is missing, naming the field -- it used to
+# match, then panic on the first announcement instead.
 regex_for_announce_match = '''.*Name:'(?P<name>.*)' uploaded by.*https://tracker.example.org/torrent/(?P<id>\d+)'''
+
+# EVERY OTHER NAMED CAPTURE BECOMES AN OPTIONAL FIELD.
+#
+# Your announce line almost certainly carries more than a name and an id --
+# a category, who uploaded it, a freeleech marker. Name a group and it is
+# captured; nothing here is tracker-specific, so a network with entirely
+# different metadata works the same way.
+#
+# A fuller pattern for a line like:
+#
+#   New Torrent Announcement: <Movies :: 4K>  Name:'Some Release 2160p'
+#   uploaded by 'someone' freeleech -  https://tracker.example.org/torrent/1234
+#
+# regex_for_announce_match = '''<(?P<category>[^:]+) :: (?P<subcategory>[^>]+)>\s+Name:'(?P<name>.*)' uploaded by '(?P<uploader>[^']+)'(?P<freeleech> freeleech)?.*/torrent/(?P<id>\d+)'''
+#
+# Two things worth knowing:
+#
+#   * A group wrapped in `?` is a MARKER. `(?P<freeleech> freeleech)?` captures
+#     only when the word is on the line, so "is this freeleech" is simply
+#     whether the field is there at all.
+#   * `file` and `key` are reserved for download_url_template and are ignored
+#     if you name a capture after them. You get a warning, not an error.
+#
+# Nothing consumes these fields yet -- that lands next. Declaring them now is
+# harmless and saves editing the regex again later.
+
+# ---------------------------------------------------------------------------
+# Splitting a capture into several values
+# ---------------------------------------------------------------------------
+#
+# Only needed when the COUNT is unknown, such as a comma-separated tag list.
+# Two fixed sub-values are better written as two groups -- the `category` and
+# `subcategory` above need nothing here.
+#
+# Values are trimmed and empty ones dropped, so "hd, remux ," yields two.
+# The unsplit text is kept as-is for the download URL.
+#
+# [captures.tags]
+# split = ","
 
 # ---------------------------------------------------------------------------
 # Tracker

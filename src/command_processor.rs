@@ -6,6 +6,7 @@ pub mod commands {
     use pub_sub::{PubSub, Subscription};
     use regex::Regex;
 
+    use crate::announce::Announce;
     use crate::auth::{redact_secrets, Authorization, AuthResult, CommandRequest, Principal};
     use crate::clients::TorrentInfo;
     use crate::torrent_processor::torrent::TorrentProcessor;
@@ -445,18 +446,31 @@ pub mod commands {
             // Bind the regex to a local so the RefCell guard from `borrow()` is
             // dropped before the await below. Holding it across the await made a
             // concurrent `borrow_mut()` panic.
-            let announce_regex = self.config.borrow().get_announce_regex();
+            let (announce_regex, capture_options) = {
+                let cfg = self.config.borrow();
+                (cfg.get_announce_regex(), cfg.get_capture_options())
+            };
 
-            let (name, id) = if let Some(caps) = announce_regex.captures(argument) {
-                (caps["name"].to_string(), caps["id"].to_string())
+            let announce = if let Some(caps) = announce_regex.captures(argument) {
+                Announce::from_captures(&announce_regex, &caps, &capture_options).ok_or_else(
+                    || {
+                        CommandError::BadArguments(
+                            "That line matched regex_for_announce_match but `name` or `id` did \
+                             not capture."
+                                .to_string(),
+                        )
+                    },
+                )?
             } else if let Some(caps) = self.bare_id_regex.captures(argument) {
                 // A link on its own carries no release name. That only costs a
                 // label: the name inside the .torrent is what the client shows,
                 // and Flood ignores this argument entirely. It names the cached
                 // .torrent file, the last (cosmetic) segment of the tracker's
                 // download URL, and the log line.
-                let id = caps["id"].to_string();
-                (format!("torrent-{id}"), id)
+                //
+                // It carries no captured fields either, which is why the filters
+                // this path already skips must stay skipped.
+                Announce::bare(caps["id"].to_string())
             } else {
                 return Err(CommandError::BadArguments(
                     "Use: cmd:addtorrent params:(<announce line, torrent link, or id>)".to_string(),
@@ -464,7 +478,7 @@ pub mod commands {
             };
 
             self.tp
-                .add_torrent(&name, &id)
+                .add_torrent(&announce)
                 .await
                 .map(|s| vec![s])
                 .map_err(CommandError::Failed)
