@@ -113,13 +113,21 @@ impl Announce {
         Some(Self { name, id, fields })
     }
 
+    /// Build from a name and id with no captured fields.
+    ///
+    /// The download path's tests use this, and `bare` is a thin wrapper over
+    /// it. Production code otherwise goes through `from_captures`.
+    pub fn new(name: String, id: String) -> Self {
+        Self { name, id, fields: BTreeMap::new() }
+    }
+
     /// A torrent named by id alone, with no announce line behind it.
     ///
     /// `cmd:addtorrent` accepts a bare link or id, which carries no release
     /// name and no fields -- ever. Named so that fact is greppable rather than
     /// implied by an empty map at a call site.
     pub fn bare(id: String) -> Self {
-        Self { name: format!("torrent-{id}"), id, fields: BTreeMap::new() }
+        Self::new(format!("torrent-{id}"), id)
     }
 
     /// The field's text as the tracker sent it.

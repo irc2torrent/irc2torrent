@@ -15,7 +15,7 @@ pub mod config {
     use tokio::fs;
 
     use crate::announce::{CaptureOptions, REQUIRED_NAMES, RESERVED_NAMES};
-    use crate::platforms::url_template::UrlTemplate;
+    use crate::platforms::url_template::{UrlTemplate, RESERVED};
     use crate::{IRC_CONFIG_FILE, OPTIONS_CONFIG_FILE};
 
     /// How long to wait for a burst of filesystem events to settle before
@@ -66,7 +66,11 @@ pub mod config {
 
             // After the regexes, so the three tests that assert on regex field
             // names keep getting the regex error rather than this one.
-            validate_platform(&data.platform)?;
+            //
+            // Takes the compiled announce regex because the URL template's
+            // placeholders are now checked against its capture names -- see
+            // `UrlTemplate::placeholder_names`.
+            validate_platform(&data.platform, &announce_regex)?;
 
             Ok(Self { data, announce_regex, dl_regexes, reject_regexes })
         }
@@ -140,7 +144,7 @@ pub mod config {
     /// Runs at startup *and* on every reload, so blanking the template in a
     /// running bot is refused and the working config kept -- the same treatment
     /// a broken regex gets.
-    fn validate_platform(p: &PlatformSection) -> Result<(), Error> {
+    fn validate_platform(p: &PlatformSection, announce_regex: &Regex) -> Result<(), Error> {
         let o = &p.options;
 
         if o.download_url_template.trim().is_empty() {
@@ -156,6 +160,31 @@ pub mod config {
 
         let template = UrlTemplate::parse(&o.download_url_template)
             .map_err(|e| Error::msg(format!("options.toml: [platform.{}]: {e}", p.label)))?;
+
+        // `url_template` can no longer tell an unknown placeholder from a valid
+        // one, because "valid" depends on a regex it never sees. This is where
+        // that is decided, and it is the only place -- `HttpTracker::new`
+        // parses the template again but has no access to the announce regex, so
+        // it will accept `{whatever}`. Production ordering saves it (from_data
+        // runs first, in lib.rs), which makes this check load-bearing rather
+        // than a convenience.
+        let declared: Vec<&str> = announce_regex.capture_names().flatten().collect();
+        for name in template.placeholder_names() {
+            if RESERVED.contains(&name.as_str()) {
+                continue;
+            }
+            if !declared.contains(&name.as_str()) {
+                return Err(Error::msg(format!(
+                    "options.toml: [platform.{}] download_url_template uses {{{name}}}, which is \
+                     not a capture group in regex_for_announce_match.\n\
+                     That regex declares: {}\n\
+                     `{{file}}` and `{{key}}` are always available; every other placeholder must \
+                     match a named capture.",
+                    p.label,
+                    declared.join(", ")
+                )));
+            }
+        }
 
         if template.uses_key() && o.rss_key.trim().is_empty() {
             return Err(Error::msg(format!(
@@ -1861,6 +1890,65 @@ pub mod config {
             let text = toml::to_string_pretty(&data).unwrap();
             let back: OptionData = toml::from_str(&text).expect("round trip");
             assert_eq!(back, data, "rendered as:\n{text}");
+        }
+
+        /// Build a config with a given announce regex and download template.
+        fn data_with_template(announce: &str, template: &str) -> OptionData {
+            let mut data = option_data_for_test();
+            data.regex_for_announce_match = announce.to_string();
+            data.platform.options.download_url_template = template.to_string();
+            data.platform.options.rss_key = "KEY".to_string();
+            data
+        }
+
+        #[test]
+        fn a_template_placeholder_must_name_a_declared_capture() {
+            // url_template can no longer tell an unknown placeholder from a
+            // valid one -- "valid" depends on a regex it never sees. This check
+            // is therefore load-bearing, not a convenience.
+            let Err(err) = LoadedOptions::from_data(data_with_template(
+                r"(?P<name>.+)/torrent/(?P<id>\d+)",
+                "https://h.example/dl/{id}/{uploader}",
+            )) else {
+                panic!("a placeholder naming no capture must be rejected");
+            };
+            let err = err.to_string();
+            assert!(err.contains("{uploader}"), "{err}");
+            assert!(err.contains("regex_for_announce_match"), "{err}");
+            assert!(err.contains("name"), "should list the declared captures: {err}");
+        }
+
+        #[test]
+        fn a_template_placeholder_naming_a_declared_capture_loads() {
+            assert!(LoadedOptions::from_data(data_with_template(
+                r"(?P<name>.+) by '(?P<uploader>[^']+)'.*/torrent/(?P<id>\d+)",
+                "https://h.example/dl/{id}/{uploader}/{file}?k={key}",
+            ))
+            .is_ok());
+        }
+
+        #[test]
+        fn file_and_key_never_need_declaring() {
+            // They are supplied by the download layer, not the announce line.
+            assert!(LoadedOptions::from_data(data_with_template(
+                r"(?P<name>.+)/torrent/(?P<id>\d+)",
+                "https://h.example/dl/{id}/{file}?k={key}",
+            ))
+            .is_ok());
+        }
+
+        #[test]
+        fn a_template_placeholder_in_the_authority_is_still_rejected() {
+            // The property that matters most, now that names are open-ended:
+            // reaching validate_platform at all means url_template accepted the
+            // name, so this has to fail on position rather than spelling.
+            let Err(err) = LoadedOptions::from_data(data_with_template(
+                r"(?P<name>.+) by '(?P<uploader>[^']+)'.*/torrent/(?P<id>\d+)",
+                "https://{uploader}.example/dl/{id}",
+            )) else {
+                panic!("a placeholder in the authority must be rejected");
+            };
+            assert!(err.to_string().contains("host or port"), "{err}");
         }
 
         #[test]

@@ -9,7 +9,7 @@ use tokio::io::AsyncWriteExt;
 
 use crate::announce::Announce;
 use crate::config::config::PlatformOptions;
-use crate::platforms::url_template::{Fields, UrlTemplate};
+use crate::platforms::url_template::{FieldSource, UrlTemplate};
 use crate::platforms::TorrentPlatform;
 
 /// Longest filename we will produce, leaving room for the ".torrent" suffix on
@@ -94,13 +94,37 @@ fn assert_within(dir: &Path, candidate: &Path) -> Result<(), Error> {
     Ok(())
 }
 
+/// What one download substitutes into the template.
+///
+/// Reserved names win: `file` and `key` are answered here and never taken from
+/// the announce line, so a capture group called `key` cannot redirect the
+/// tracker credential into a value an attacker chose. `Announce` already drops
+/// those names, making this the second of two independent guards.
+struct DownloadFields<'a> {
+    announce: &'a Announce,
+    file: &'a str,
+    key: &'a str,
+}
+
+impl FieldSource for DownloadFields<'_> {
+    fn get(&self, name: &str) -> Option<&str> {
+        match name {
+            "file" => Some(self.file),
+            "key" => Some(self.key),
+            other => self.announce.get(other),
+        }
+    }
+}
+
 impl TorrentPlatform for HttpTracker {
     fn get_torrent_files_dir(&self) -> &PathBuf {
         &self.torrent_dir
     }
 
     async fn download_torrent(&self, announce: &Announce) -> Result<String, Error> {
-        let (name, id) = (announce.name.as_str(), announce.id.as_str());
+        // `id` is no longer pulled out here: the template reads it, and every
+        // other placeholder, through `DownloadFields`.
+        let name = announce.name.as_str();
         info!("Downloading torrent from {}: {}", self.label, name);
 
         let torrent_file = sanitize_torrent_filename(name);
@@ -109,9 +133,8 @@ impl TorrentPlatform for HttpTracker {
         // include the URL in an error or log line. `render` percent-encodes each
         // substituted value and re-checks the host, because `name` and `id` come
         // straight off IRC -- see platforms::url_template.
-        let url = self.template.render(Fields {
-            id,
-            name,
+        let url = self.template.render(&DownloadFields {
+            announce,
             file: &torrent_file,
             key: &self.rss_key,
         })?;
@@ -221,11 +244,11 @@ mod test {
         )
         .unwrap();
         let name = "Some Release S01 1080p WEB-DL";
+        let announce = Announce::new(name.to_string(), "1".to_string());
         let url = t
             .template
-            .render(Fields {
-                id: "1",
-                name,
+            .render(&DownloadFields {
+                announce: &announce,
                 file: &sanitize_torrent_filename(name),
                 key: "KEY",
             })
@@ -237,6 +260,25 @@ mod test {
     fn new_rejects_a_template_it_cannot_parse() {
         assert!(HttpTracker::new("Example", &options("")).is_err());
         assert!(HttpTracker::new("Example", &options("not a url")).is_err());
-        assert!(HttpTracker::new("Example", &options("https://h.example/{nope}")).is_err());
+        // A malformed placeholder *name* is still rejected here...
+        assert!(HttpTracker::new("Example", &options("https://h.example/{a-b}")).is_err());
+        // ...but an unknown one is not, and cannot be: whether `{nope}` names a
+        // real capture depends on regex_for_announce_match, which this
+        // constructor never sees. `validate_platform` decides that, and runs
+        // first in production -- see the comment there.
+        assert!(HttpTracker::new("Example", &options("https://h.example/{nope}")).is_ok());
+    }
+
+    #[test]
+    fn a_capture_named_key_cannot_displace_the_rss_key() {
+        // Two independent guards: `Announce` drops the name on the way in, and
+        // `DownloadFields` answers it before consulting the announce at all.
+        let t = HttpTracker::new("Example", &options("https://h.example/d?k={key}")).unwrap();
+        let announce = Announce::new("rel".to_string(), "1".to_string());
+        let url = t
+            .template
+            .render(&DownloadFields { announce: &announce, file: "f.torrent", key: "REAL" })
+            .unwrap();
+        assert!(url.ends_with("k=REAL"), "{url}");
     }
 }

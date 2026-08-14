@@ -167,8 +167,11 @@ sub-values like `category`/`subcategory` are better written as two groups. Namin
 that the regex does not declare is a startup error, because the alternative is a field that
 silently never appears.
 
-> Fields are captured and validated now; the features that consume them — filtering, client tags,
-> URL placeholders — land next. Declaring them early is harmless.
+Captured fields can be used in [`download_url_template`](#configuration) straight away — a tracker
+whose download URL needs an `authkey` from the announce line just names the group and uses
+`{authkey}`.
+
+> Filtering on these fields and passing them to the client as tags land next.
 
 And two on the tracker block:
 
@@ -876,8 +879,11 @@ configs are otherwise unchanged — add one line to your `[platform.*]` block:
 download_url_template = "https://your.tracker/rss/download/{id}/{key}/{file}"
 ```
 
-`{id}`, `{name}`, `{file}` and `{key}` are the placeholders; `{key}` is your `rss_key`. Without it
-the bot refuses to start and says so, naming the field.
+`{file}` and `{key}` are always available — `{key}` is your `rss_key`, and without it the bot
+refuses to start and says so, naming the field. **Every other placeholder is one of your captures**:
+`{id}` and `{name}` are not special, they are simply the two groups every config declares. A
+placeholder naming a group your regex does not declare is a startup error listing what it does
+declare, rather than a 404 later.
 
 Two related changes in the same release, both of which only affect *newly generated* configs —
 your existing `irc.toml` is untouched:

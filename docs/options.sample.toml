@@ -94,14 +94,24 @@ regex_for_announce_match = '''.*Name:'(?P<name>.*)' uploaded by.*https://tracker
 # else's site. Copy the URL your tracker's "download" button produces and
 # replace the varying parts with placeholders:
 #
-#   {id}    the `id` capture from regex_for_announce_match
-#   {name}  the `name` capture, verbatim from IRC
 #   {file}  the sanitised filename actually written to torrent_dir,
 #           ".torrent" included
 #   {key}   rss_key, below
 #
-# Write `{{` or `}}` for a literal brace. Anything else in braces is an error at
-# startup rather than a 404 later.
+# Those two are always available. EVERY OTHER PLACEHOLDER IS ONE OF YOUR
+# CAPTURES -- {id} and {name} are not special, they simply happen to be the two
+# groups every config declares. If your regex names an `authkey` group, then
+# `{authkey}` works here too:
+#
+#   download_url_template = "https://tracker.example.org/download/{id}/{authkey}/{file}"
+#
+# A placeholder naming a group your regex does not declare is a startup error
+# listing what it does declare, rather than a 404 later. Write `{{` or `}}` for
+# a literal brace.
+#
+# Placeholders are never allowed in the host, userinfo or port -- they are
+# filled from IRC messages, and a release name that could move the host would
+# send your rss_key to somebody else's server. Path, query and fragment only.
 #
 # {name} and {id} come straight off IRC, so every substituted value is
 # percent-encoded and the host is re-checked before the request goes out — a
