@@ -322,6 +322,21 @@ on_warning = false
 # One roll-up per day: added / finished / failed / restarts.
 daily_summary = false
 
+# What time of day that roll-up is sent, 24-hour HH:MM in the bot's local
+# timezone. It used to go out 24 hours after the bot started, which meant it
+# arrived at whatever hour the container last came up and moved again on every
+# restart.
+#
+# Local means the process timezone — set TZ in the container (the image ships
+# the zoneinfo it needs), otherwise this is UTC:
+#
+#   docker run -e TZ=Europe/Oslo ...
+#
+# The counters live in memory, so a restart resets them and the summary covers
+# from the last restart rather than a strict 24 hours. If the bot is down at the
+# appointed time that day's summary is skipped, not sent late.
+daily_summary_at = "09:00"
+
 # The bot coming up — "irc2torrent 0.13.0 is up (commands, ntfy, telegram)" —
 # and IRC coming back after an outage you were told about.
 #

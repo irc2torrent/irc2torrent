@@ -651,8 +651,18 @@ on_download_finished = true    # a torrent reaching 100%
 on_disk_low          = true    # free space below disk_warn_percent
 on_warning           = false   # a release your match list wanted, dropped by your reject list
 daily_summary        = false   # one roll-up a day
+daily_summary_at     = "09:00" # ...at this local time
 on_start             = true    # the bot came up, and IRC came back
 ```
+
+`daily_summary_at` is 24-hour `HH:MM` in the **bot's local timezone**, so set `TZ` on the container
+(`-e TZ=Europe/Oslo`) — the image already carries the zoneinfo, and without it the time is UTC.
+Before this existed the roll-up ran on a 24-hour timer started with the process, which put it at
+whatever hour the container last came up and moved it again on every restart.
+
+The counters are in memory: a restart resets them, so the summary covers "since the last restart",
+not a strict 24 hours. If the bot is down at the appointed time, that day's summary is skipped
+rather than sent late.
 
 `on_warning` covers the one filter outcome worth being told about: an announcement that matched
 `regex_for_downloads_match` and was then thrown away by `regex_for_downloads_reject_match`. Reject

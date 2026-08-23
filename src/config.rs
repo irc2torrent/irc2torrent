@@ -22,6 +22,12 @@ pub mod config {
     /// coalescing serves both purposes.
     const RELOAD_DEBOUNCE: Duration = Duration::from_millis(250);
 
+    /// When the daily summary goes out if the config does not say.
+    ///
+    /// Morning on purpose: the report covers the night's activity, which is when
+    /// an announce channel is busiest and when nobody was watching.
+    pub const DEFAULT_SUMMARY_TIME: &str = "09:00";
+
     /// The parsed options plus the regexes compiled from them.
     ///
     /// The accessors used to call `Regex::new` on every use, which meant
@@ -61,9 +67,33 @@ pub mod config {
             // After the regexes, so the three tests that assert on regex field
             // names keep getting the regex error rather than this one.
             validate_platform(&data.platform)?;
+            parse_summary_time(&data.notifications.daily_summary_at)?;
 
             Ok(Self { data, announce_regex, dl_regexes, reject_regexes })
         }
+    }
+
+    /// Parse `daily_summary_at` into (hour, minute).
+    ///
+    /// Rejected at load and on every reload, like a bad regex, because the
+    /// failure is otherwise invisible: a summary that never arrives looks
+    /// exactly like a quiet day.
+    pub fn parse_summary_time(value: &str) -> Result<(u32, u32), Error> {
+        let complain = || {
+            Error::msg(format!(
+                "options.toml: [notifications] daily_summary_at = \"{value}\" is not a time.\n\
+                 Use 24-hour HH:MM in the bot's local timezone, for example:\n\n    \
+                 daily_summary_at = \"{DEFAULT_SUMMARY_TIME}\""
+            ))
+        };
+
+        let (h, m) = value.trim().split_once(':').ok_or_else(complain)?;
+        let hour: u32 = h.trim().parse().map_err(|_| complain())?;
+        let minute: u32 = m.trim().parse().map_err(|_| complain())?;
+        if hour > 23 || minute > 59 {
+            return Err(complain());
+        }
+        Ok((hour, minute))
     }
 
     /// Reject a tracker section that cannot actually download anything.
@@ -390,6 +420,20 @@ pub mod config {
         pub on_warning: bool,
         /// One roll-up per day of everything above.
         pub daily_summary: bool,
+        /// Local wall-clock time to send that roll-up, as `HH:MM`.
+        ///
+        /// It replaced a plain 24-hour interval anchored to process start,
+        /// which put the report at whatever time the bot last came up and moved
+        /// it again on every restart -- a daily report that arrives at a
+        /// different hour each week is one nobody reads.
+        ///
+        /// Local means the process timezone: `TZ` in a container, which needs
+        /// the zoneinfo the runtime image already carries. Unset means UTC.
+        ///
+        /// Stays here next to the switch it qualifies rather than moving to the
+        /// shaping group below; it is a bare key either way, which is all TOML
+        /// cares about.
+        pub daily_summary_at: String,
         /// The bot coming up, and IRC coming back after an outage that was
         /// reported. On by default: it is the answer to "did my restart work?",
         /// it happens once per start, and a crash loop collapses into a count
@@ -484,6 +528,7 @@ pub mod config {
                 on_disk_low: true,
                 on_warning: false,
                 daily_summary: false,
+                daily_summary_at: DEFAULT_SUMMARY_TIME.to_string(),
                 on_start: true,
                 digest_seconds: 300,
                 max_per_hour: 20,
@@ -1655,6 +1700,38 @@ pub mod config {
                 // download_url_template, which from_data rejects first.
                 ..option_data_for_test()
             }
+        }
+
+        #[test]
+        fn a_summary_time_is_parsed_as_24_hour_local_time() {
+            assert_eq!(parse_summary_time("09:00").unwrap(), (9, 0));
+            assert_eq!(parse_summary_time("23:45").unwrap(), (23, 45));
+            assert_eq!(parse_summary_time("00:00").unwrap(), (0, 0));
+            assert_eq!(parse_summary_time(" 7:05 ").unwrap(), (7, 5));
+        }
+
+        /// Rejected rather than quietly defaulted: a summary that never arrives
+        /// is indistinguishable from a quiet day, so the mistake has to surface
+        /// where every other config mistake does -- at load, naming the field.
+        #[test]
+        fn a_time_that_is_not_a_time_is_refused() {
+            for bad in ["9am", "24:00", "09:60", "0900", "", "09:00:30", "-1:00"] {
+                let e = parse_summary_time(bad)
+                    .expect_err(&format!("{bad:?} should not parse"))
+                    .to_string();
+                assert!(e.contains("daily_summary_at"), "{bad:?}: {e}");
+            }
+        }
+
+        /// And the same check runs on a live reload, like a broken regex does.
+        #[test]
+        fn a_bad_summary_time_fails_the_whole_load() {
+            let mut data = option_data_for_test();
+            data.notifications.daily_summary_at = "half past nine".to_string();
+            let Err(err) = LoadedOptions::from_data(data) else {
+                panic!("an unparseable daily_summary_at must be rejected");
+            };
+            assert!(err.to_string().contains("daily_summary_at"), "{err}");
         }
 
         #[test]

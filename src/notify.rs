@@ -18,10 +18,14 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::Error;
+use chrono::{DateTime, Duration as ChronoDuration, Local, LocalResult, TimeZone};
 use log::{error, info, warn};
 use tokio::sync::mpsc;
 
-use crate::config::config::{EmailOptions, EventFilter, NotificationOptions, NtfyOptions};
+use crate::config::config::{
+    parse_summary_time, EmailOptions, EventFilter, NotificationOptions, NtfyOptions,
+    DEFAULT_SUMMARY_TIME,
+};
 
 /// Queue depth before events are dropped.
 ///
@@ -862,6 +866,49 @@ fn flat_lines(subject: &str, body: &str) -> Vec<String> {
         .collect()
 }
 
+/// The next instant the local wall clock reads `hour:minute`, strictly after
+/// `now`.
+///
+/// The daily summary used to run off `interval(86_400)`, which anchors the first
+/// tick to process start: the report arrived 24 hours after the container last
+/// came up, and every restart moved it to a new time of day. A report that turns
+/// up at a different hour each week is one nobody reads.
+///
+/// Recomputed from the wall clock after each send rather than by adding 24
+/// hours, so the two days a year that are not 24 hours long stay correct instead
+/// of dragging the appointment an hour off for the next six months.
+fn next_summary_after((hour, minute): (u32, u32), now: DateTime<Local>) -> DateTime<Local> {
+    // Today first, then tomorrow. The third day is only reachable if a zone
+    // skipped the configured minute entirely on both -- it cannot happen, and
+    // looping twice is cheaper than reasoning about whether it can.
+    for days in 0..=2i64 {
+        if let Some(candidate) = local_at(now.date_naive() + ChronoDuration::days(days), hour, minute)
+        {
+            if candidate > now {
+                return candidate;
+            }
+        }
+    }
+    now + ChronoDuration::days(1)
+}
+
+/// A local date and time, resolving the two ways a wall clock lies on a DST
+/// boundary.
+fn local_at(day: chrono::NaiveDate, hour: u32, minute: u32) -> Option<DateTime<Local>> {
+    let naive = day.and_hms_opt(hour, minute, 0)?;
+    match Local.from_local_datetime(&naive) {
+        LocalResult::Single(dt) => Some(dt),
+        // The clock reads this time twice (autumn). Take the first, so the
+        // report goes out the first time the clock says it should.
+        LocalResult::Ambiguous(first, _) => Some(first),
+        // The clock never reads this time (spring). Take the same wall-clock
+        // offset on the far side of the jump rather than skipping the day.
+        LocalResult::None => {
+            Local.from_local_datetime(&(naive + ChronoDuration::hours(1))).earliest()
+        }
+    }
+}
+
 /// Long-running task that owns the targets and does the shaping.
 struct Dispatcher {
     rx: mpsc::Receiver<Event>,
@@ -907,8 +954,13 @@ impl Dispatcher {
         retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         retry.tick().await;
 
-        let mut daily = tokio::time::interval(Duration::from_secs(86_400));
-        daily.tick().await;
+        // The daily summary is a wall-clock appointment, not an interval. See
+        // `next_summary_after`.
+        let mut summary_time = self.summary_time();
+        let mut next_summary = next_summary_after(summary_time, Local::now());
+        if self.wants_summary() {
+            info!("Daily summary is due at {}.", next_summary.format("%Y-%m-%d %H:%M %z"));
+        }
 
         loop {
             // Adopt any config change before deciding anything with it. Once per
@@ -921,6 +973,25 @@ impl Dispatcher {
                 flush = tokio::time::interval(Duration::from_secs(digest));
                 flush.tick().await;
             }
+
+            let configured = self.summary_time();
+            if configured != summary_time {
+                summary_time = configured;
+                next_summary = next_summary_after(summary_time, Local::now());
+                info!("Daily summary is now due at {}.", next_summary.format("%Y-%m-%d %H:%M %z"));
+            } else if !self.wants_summary() {
+                // Keep the appointment current while nothing wants it, so
+                // enabling the summary at 15:00 does not immediately fire the
+                // 09:00 deadline that quietly went stale behind it.
+                next_summary = next_summary_after(summary_time, Local::now());
+            }
+
+            // Re-derived from the wall clock on every wake-up rather than held
+            // as a fixed timer: the loop already wakes at least every
+            // RETRY_INTERVAL, so a DST change or an NTP step is absorbed within
+            // one wake-up instead of skewing the appointment until restart.
+            let until_summary =
+                (next_summary - Local::now()).to_std().unwrap_or(Duration::ZERO);
 
             tokio::select! {
                 received = self.rx.recv() => {
@@ -961,7 +1032,10 @@ impl Dispatcher {
                     }
                     self.retry_outboxes().await;
                 }
-                _ = daily.tick(), if self.wants_summary() => self.send_summary().await,
+                _ = tokio::time::sleep(until_summary), if self.wants_summary() => {
+                    self.send_summary().await;
+                    next_summary = next_summary_after(summary_time, Local::now());
+                }
             }
         }
     }
@@ -1007,6 +1081,26 @@ impl Dispatcher {
         }
 
         self.options = fresh;
+    }
+
+    /// The configured summary time, or the default if the config somehow holds
+    /// a value that does not parse.
+    ///
+    /// `LoadedOptions::from_data` rejects an unparseable one at load and on
+    /// reload, so this cannot normally happen -- but the fallback here is what
+    /// makes it a mis-set time rather than a panic in the notification task if
+    /// it ever does.
+    fn summary_time(&self) -> (u32, u32) {
+        match parse_summary_time(&self.options.daily_summary_at) {
+            Ok(hm) => hm,
+            Err(_) => {
+                warn!(
+                    "daily_summary_at = \"{}\" is not an HH:MM time; using {DEFAULT_SUMMARY_TIME}.",
+                    self.options.daily_summary_at
+                );
+                parse_summary_time(DEFAULT_SUMMARY_TIME).expect("the default is a valid time")
+            }
+        }
     }
 
     /// Whether any target takes the daily summary; without this the timer would
@@ -1409,7 +1503,59 @@ pub async fn poll(
 
 #[cfg(test)]
 mod test {
+    use chrono::Timelike;
+
     use super::*;
+
+    /// A fixed local time, so these cases do not depend on the clock.
+    fn local(y: i32, m: u32, d: u32, hh: u32, mm: u32) -> DateTime<Local> {
+        local_at(chrono::NaiveDate::from_ymd_opt(y, m, d).unwrap(), hh, mm)
+            .expect("a real local time")
+    }
+
+    #[test]
+    fn the_summary_is_due_later_today_when_the_time_is_still_ahead() {
+        let now = local(2026, 3, 10, 7, 30);
+        assert_eq!(next_summary_after((9, 0), now), local(2026, 3, 10, 9, 0));
+    }
+
+    #[test]
+    fn the_summary_rolls_to_tomorrow_once_the_time_has_passed() {
+        let now = local(2026, 3, 10, 9, 1);
+        assert_eq!(next_summary_after((9, 0), now), local(2026, 3, 11, 9, 0));
+    }
+
+    /// Strictly after `now`, not "at or after": this is recomputed the instant
+    /// the summary has been sent, and an inclusive comparison would return the
+    /// deadline that just fired and send the report again in a loop.
+    #[test]
+    fn the_deadline_never_lands_on_the_moment_it_was_computed() {
+        let due = local(2026, 3, 10, 9, 0);
+        assert_eq!(next_summary_after((9, 0), due), local(2026, 3, 11, 9, 0));
+    }
+
+    /// A clock that skips the configured minute must still produce a deadline
+    /// that day. 02:30 does not exist in most of Europe on 2026-03-29; in a zone
+    /// without a spring-forward it simply does. Either way the report belongs to
+    /// the 29th, so this asserts the day rather than the hour and holds whatever
+    /// `TZ` the test runs under.
+    #[test]
+    fn a_time_the_clock_may_skip_still_lands_on_that_day() {
+        let next = next_summary_after((2, 30), local(2026, 3, 28, 12, 0));
+        assert_eq!(next.date_naive(), chrono::NaiveDate::from_ymd_opt(2026, 3, 29).unwrap());
+    }
+
+    /// The whole point of a wall-clock appointment: it holds regardless of when
+    /// the process started, which the old `interval(86_400)` did not.
+    #[test]
+    fn the_time_of_day_is_the_same_whenever_it_is_computed_from() {
+        let due = local(2026, 3, 10, 23, 45);
+        for hour in 0..24 {
+            let next = next_summary_after((23, 45), local(2026, 3, 10, hour, 0));
+            assert_eq!((next.hour(), next.minute()), (23, 45), "from {hour}:00");
+            assert!(next >= due, "from {hour}:00");
+        }
+    }
 
     #[test]
     fn a_known_provider_needs_only_an_address() {
