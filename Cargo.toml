@@ -97,6 +97,10 @@ fastrand = "2"
 # inside their own URL component is a security primitive -- not something to
 # hand-roll. See src/platforms/url_template.rs.
 percent-encoding = "2"
+# Already in the tree via simplelog, whose ConfigBuilder::set_time_offset takes a
+# time::UtcOffset. Direct only so main.rs can name that type; the value itself
+# comes from chrono. See local_time_offset().
+time = "0.3"
 # Slack Socket Mode is a WebSocket -- the one thing reqwest cannot do. rustls
 # with bundled roots, matching the stance everywhere else: no native-tls, no
 # OpenSSL. Only Slack needs this; Telegram is plain HTTPS.
