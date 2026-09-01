@@ -14,6 +14,7 @@ pub mod irc {
     use pub_sub::{PubSub, Subscription};
     use regex::Regex;
 
+    use crate::announce::Announce;
     use crate::auth::AuthResult::*;
     use crate::auth::MessageTypes::Announcement;
     use crate::auth::{redact_secrets, Authorization, MessageOrigin};
@@ -781,10 +782,24 @@ pub mod irc {
                 return;
             }
 
-            let announce_regex = self.config.borrow().get_announce_regex();
+            // Both in one borrow, and bound to locals so the RefCell guard is
+            // dropped before the await below.
+            let (announce_regex, capture_options) = {
+                let cfg = self.config.borrow();
+                (cfg.get_announce_regex(), cfg.get_capture_options())
+            };
             if let Some(caps) = announce_regex.captures(inner_message) {
-                let (name, id) = (caps["name"].to_string(), caps["id"].to_string());
-                self.torrent_msg_process(target, sender, &name, &id).await;
+                match Announce::from_captures(&announce_regex, &caps, &capture_options) {
+                    Some(announce) => self.torrent_msg_process(target, sender, &announce).await,
+                    // Config validation requires both groups, so getting here
+                    // means they are declared inside an alternation that did not
+                    // fire. Previously this indexed the captures directly and
+                    // panicked in the read loop.
+                    None => warn!(
+                        "Announce line matched but `name` or `id` did not capture; ignoring it. \
+                         Check for an alternation in regex_for_announce_match."
+                    ),
+                }
             } else {
                 info!("Message is not a torrent or a command.");
             }
@@ -995,13 +1010,23 @@ pub mod irc {
             }
         }
 
-        async fn torrent_msg_process(&mut self, target: &str, sender: &str, name: &str, id: &str) {
-            info!("Torrent name: {}", name);
-            info!("Torrent Id: {}", id);
+        async fn torrent_msg_process(&mut self, target: &str, sender: &str, announce: &Announce) {
+            info!("Torrent name: {}", announce.name);
+            info!("Torrent Id: {}", announce.id);
+            let extra: Vec<String> = announce
+                .field_names()
+                .map(|f| match announce.get(f) {
+                    Some("") | None => f.to_string(),
+                    Some(v) => format!("{f}={v}"),
+                })
+                .collect();
+            if !extra.is_empty() {
+                info!("Torrent fields: {}", extra.join(", "));
+            }
 
             let origin = MessageOrigin::new(sender, target, &self.our_nick);
             if let SourceValidated = self.auth.authenticate(&origin, "", Announcement) {
-                let outcome = self.tp.process_torrent(&name.to_string(), &id.to_string()).await;
+                let outcome = self.tp.process_torrent(announce).await;
                 // reply_to, not target: for a private message the target is our
                 // own nick, so replying there made the bot message itself and
                 // then process its own reply.

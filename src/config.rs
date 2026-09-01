@@ -1,4 +1,5 @@
 pub mod config {
+    use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
     use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
@@ -13,7 +14,9 @@ pub mod config {
     use serde_derive::{Deserialize, Serialize};
     use tokio::fs;
 
-    use crate::platforms::url_template::UrlTemplate;
+    use crate::announce::{CaptureOptions, REQUIRED_NAMES, RESERVED_NAMES};
+    use crate::platforms::url_template::{UrlTemplate, RESERVED};
+    use crate::template::TextTemplate;
     use crate::{IRC_CONFIG_FILE, OPTIONS_CONFIG_FILE};
 
     /// How long to wait for a burst of filesystem events to settle before
@@ -38,8 +41,12 @@ pub mod config {
     pub struct LoadedOptions {
         data: OptionData,
         announce_regex: Regex,
-        dl_regexes: Vec<Regex>,
+        /// `data.regex_for_downloads_match` compiled, entry rules included.
+        dl_watches: Vec<CompiledWatch>,
         reject_regexes: Vec<Regex>,
+        /// `data.field_filters` compiled, in the map's sorted order so the
+        /// first rule to veto is the same one every time.
+        field_filters: Vec<(String, CompiledFieldFilter)>,
     }
 
     impl LoadedOptions {
@@ -58,18 +65,88 @@ pub mod config {
                     .collect()
             };
 
-            let dl_regexes = compile_all(&data.regex_for_downloads_match, "regex_for_downloads_match")?;
             let reject_regexes = compile_all(
                 &data.regex_for_downloads_reject_match,
                 "regex_for_downloads_reject_match",
             )?;
 
+            // Compiles one `[field_filters.*]` map, wherever it came from.
+            let compile_filters = |filters: &BTreeMap<String, FieldFilter>,
+                                   where_: &str|
+             -> Result<Vec<(String, CompiledFieldFilter)>, Error> {
+                filters
+                    .iter()
+                    .map(|(field, f)| {
+                        let compile =
+                            |p: &Option<String>, which: &str| -> Result<Option<Regex>, Error> {
+                                p.as_deref()
+                                    .map(|p| {
+                                        Regex::new(p).map_err(|e| {
+                                            Error::msg(format!(
+                                                "{where_}{field}.{which} is not a valid regex: {e}"
+                                            ))
+                                        })
+                                    })
+                                    .transpose()
+                            };
+                        Ok((
+                            field.clone(),
+                            CompiledFieldFilter {
+                                matches: compile(&f.matches, "matches")?,
+                                reject_matching: compile(&f.reject_matching, "reject_matching")?,
+                            },
+                        ))
+                    })
+                    .collect()
+            };
+
+            let dl_watches = data
+                .regex_for_downloads_match
+                .iter()
+                .map(|entry| {
+                    let regex = Regex::new(entry.pattern()).map_err(|e| {
+                        Error::msg(format!(
+                            "regex_for_downloads_match contains an invalid regex: {e}"
+                        ))
+                    })?;
+                    let field_filters = match entry.field_filters() {
+                        Some(f) => compile_filters(
+                            f,
+                            &format!("regex_for_downloads_match entry '{}': field_filters.", entry.pattern()),
+                        )?,
+                        None => Vec::new(),
+                    };
+                    Ok(CompiledWatch {
+                        regex,
+                        require_fields: entry.require_fields().to_vec(),
+                        field_filters,
+                    })
+                })
+                .collect::<Result<Vec<_>, Error>>()?;
+
+            // Before the platform check but after the regexes, matching the
+            // ordering rationale below: this one is also about a regex field.
+            validate_announce_captures(
+                &announce_regex,
+                &data.captures,
+                &data.require_fields,
+                &data.field_filters,
+                &data.regex_for_downloads_match,
+                &data.clients,
+            )?;
+
+            let field_filters = compile_filters(&data.field_filters, "field_filters.")?;
+
             // After the regexes, so the three tests that assert on regex field
             // names keep getting the regex error rather than this one.
-            validate_platform(&data.platform)?;
+            //
+            // Takes the compiled announce regex because the URL template's
+            // placeholders are now checked against its capture names -- see
+            // `UrlTemplate::placeholder_names`.
+            validate_platform(&data.platform, &announce_regex)?;
             parse_summary_time(&data.notifications.daily_summary_at)?;
 
-            Ok(Self { data, announce_regex, dl_regexes, reject_regexes })
+            Ok(Self { data, announce_regex, dl_watches, reject_regexes, field_filters })
         }
     }
 
@@ -96,12 +173,144 @@ pub mod config {
         Ok((hour, minute))
     }
 
+    /// Reject an announce regex the rest of the crate cannot work with.
+    ///
+    /// `name` and `id` used to be read with `caps["name"]`, which panics on a
+    /// group that is missing *or* did not participate -- inside the IRC read
+    /// loop, so a config typo took the bot down on the first announcement
+    /// instead of at startup. Checking here means both startup and every reload
+    /// are covered, and a running bot survives a bad edit.
+    fn validate_announce_captures(
+        re: &Regex,
+        captures: &BTreeMap<String, CaptureOptions>,
+        require_fields: &[String],
+        field_filters: &BTreeMap<String, FieldFilter>,
+        watches: &[WatchEntry],
+        clients: &[TorrentClientOption],
+    ) -> Result<(), Error> {
+        let declared: Vec<&str> = re.capture_names().flatten().collect();
+
+        for required in REQUIRED_NAMES {
+            if !declared.contains(&required) {
+                let found = if declared.is_empty() {
+                    "it declares no named groups at all".to_string()
+                } else {
+                    format!("it declares: {}", declared.join(", "))
+                };
+                return Err(Error::msg(format!(
+                    "options.toml: regex_for_announce_match has no (?P<{required}>...) group -- \
+                     {found}.\n\
+                     Both `name` and `id` are required: `name` is the release, `id` is what the \
+                     download URL is built from. For example:\n\n    \
+                     regex_for_announce_match = '''.*Name:'(?P<name>.*)' uploaded by.*\
+                     /torrent/(?P<id>\\d+)'''\n\n\
+                     Any other named group you add becomes an optional field. See \
+                     docs/options.sample.toml."
+                )));
+            }
+        }
+
+        // A split configured for a group that does not exist is a typo, and a
+        // silent one: the field simply never appears and whatever consumes it
+        // behaves as though the tracker stopped sending it.
+        for name in captures.keys() {
+            if !declared.contains(&name.as_str()) {
+                return Err(Error::msg(format!(
+                    "options.toml: [captures.{name}] does not name a group in \
+                     regex_for_announce_match, which declares: {}",
+                    declared.join(", ")
+                )));
+            }
+        }
+
+        // A filter naming a group that does not exist is the worst failure this
+        // feature can produce: `require_fields = ["freelech"]` skips every
+        // release, which looks exactly like a dead announce channel rather than
+        // a typo. Never let it start.
+        let check = |field: &str, where_: &str| -> Result<(), Error> {
+            if declared.contains(&field) {
+                return Ok(());
+            }
+            Err(Error::msg(format!(
+                "options.toml: {where_} names `{field}`, which is not a capture group in \
+                 regex_for_announce_match.\n\
+                 That regex declares: {}\n\
+                 A filter on a field that can never appear would skip every release.",
+                declared.join(", ")
+            )))
+        };
+        for field in require_fields {
+            check(field, "require_fields")?;
+        }
+        for field in field_filters.keys() {
+            check(field, &format!("[field_filters.{field}]"))?;
+        }
+        // Per-entry rules get the same treatment, named by their pattern so the
+        // error points at the line to fix rather than at the list.
+        for entry in watches {
+            let at = format!("regex_for_downloads_match entry '{}'", entry.pattern());
+            for field in entry.require_fields() {
+                check(field, &format!("{at}: require_fields"))?;
+            }
+            if let Some(filters) = entry.field_filters() {
+                for field in filters.keys() {
+                    check(field, &format!("{at}: field_filters.{field}"))?;
+                }
+            }
+        }
+
+        // The client's metadata templates get the same treatment. A placeholder
+        // that can never resolve would otherwise render empty forever -- a tag
+        // that silently stops appearing rather than a startup error.
+        for client in clients {
+            let templates: Vec<(&str, String)> = match client {
+                TorrentClientOption::QBittorrent(q) => vec![
+                    (q.tags_template.as_str(), "[clients.qBittorrent] tags_template".into()),
+                    (
+                        q.category_template.as_str(),
+                        "[clients.qBittorrent] category_template".into(),
+                    ),
+                ],
+                TorrentClientOption::rTorrent(r) => vec![(
+                    r.tags_template.as_str(),
+                    "[clients.rTorrent] tags_template".into(),
+                )],
+                TorrentClientOption::Flood(_) => Vec::new(),
+            };
+
+            for (template, at) in templates {
+                if template.trim().is_empty() {
+                    continue;
+                }
+                for name in TextTemplate::parse(template, &at)?.placeholder_names() {
+                    check(name, &at)?;
+                }
+            }
+        }
+
+        // A warning rather than an error: `file` and `key` are supplied by the
+        // download URL template itself, so a capture with either name is
+        // ignored. Confusing, but not exploitable -- and rejecting it would
+        // break a config where the group happens to be unused.
+        for name in &declared {
+            if RESERVED_NAMES.contains(name) {
+                warn!(
+                    "regex_for_announce_match declares a group named `{name}`, which is reserved \
+                     for download_url_template and will be ignored. Rename it if you meant to use \
+                     it as a field."
+                );
+            }
+        }
+
+        Ok(())
+    }
+
     /// Reject a tracker section that cannot actually download anything.
     ///
     /// Runs at startup *and* on every reload, so blanking the template in a
     /// running bot is refused and the working config kept -- the same treatment
     /// a broken regex gets.
-    fn validate_platform(p: &PlatformSection) -> Result<(), Error> {
+    fn validate_platform(p: &PlatformSection, announce_regex: &Regex) -> Result<(), Error> {
         let o = &p.options;
 
         if o.download_url_template.trim().is_empty() {
@@ -117,6 +326,31 @@ pub mod config {
 
         let template = UrlTemplate::parse(&o.download_url_template)
             .map_err(|e| Error::msg(format!("options.toml: [platform.{}]: {e}", p.label)))?;
+
+        // `url_template` can no longer tell an unknown placeholder from a valid
+        // one, because "valid" depends on a regex it never sees. This is where
+        // that is decided, and it is the only place -- `HttpTracker::new`
+        // parses the template again but has no access to the announce regex, so
+        // it will accept `{whatever}`. Production ordering saves it (from_data
+        // runs first, in lib.rs), which makes this check load-bearing rather
+        // than a convenience.
+        let declared: Vec<&str> = announce_regex.capture_names().flatten().collect();
+        for name in template.placeholder_names() {
+            if RESERVED.contains(&name.as_str()) {
+                continue;
+            }
+            if !declared.contains(&name.as_str()) {
+                return Err(Error::msg(format!(
+                    "options.toml: [platform.{}] download_url_template uses {{{name}}}, which is \
+                     not a capture group in regex_for_announce_match.\n\
+                     That regex declares: {}\n\
+                     `{{file}}` and `{{key}}` are always available; every other placeholder must \
+                     match a named capture.",
+                    p.label,
+                    declared.join(", ")
+                )));
+            }
+        }
 
         if template.uses_key() && o.rss_key.trim().is_empty() {
             return Err(Error::msg(format!(
@@ -249,9 +483,32 @@ pub mod config {
         platform: PlatformSection,
         clients: Vec<TorrentClientOption>,
         command_options: CommandOptions,
-        regex_for_downloads_match: Vec<String>,
+        regex_for_downloads_match: Vec<WatchEntry>,
         regex_for_downloads_reject_match: Vec<String>,
         regex_for_announce_match: String,
+        /// Captures that must have participated, or the release is skipped.
+        ///
+        /// The whole of "only take freeleech" is `require_fields =
+        /// ["freeleech"]`, given a `(?P<freeleech>...)?` group. An array rather
+        /// than a table, so it sits with the scalars above the tables below.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        require_fields: Vec<String>,
+        /// Per-capture handling for the optional groups in the announce regex.
+        ///
+        /// A table, so it must sit with the other tables below rather than
+        /// among the scalars above. Skipped when empty so it never appears in
+        /// the file `cmd:addtowatchlist` rewrites for the many users who do not
+        /// set it -- see `update_option_file`.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        captures: BTreeMap<String, CaptureOptions>,
+        /// Per-field value rules, as `[field_filters.<capture>]`.
+        ///
+        /// Separate from `regex_for_downloads_match`, which matches the release
+        /// name: these match one named field, and run only after the name lists
+        /// have already said yes -- so the "your reject list ate a match"
+        /// warning keeps meaning what it says.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        field_filters: BTreeMap<String, FieldFilter>,
         /// Absent in configs written before notifications existed, so it must
         /// default rather than fail the whole parse and take the bot down on
         /// upgrade.
@@ -267,6 +524,101 @@ pub mod config {
         telegram: Option<TelegramOptions>,
         #[serde(default)]
         slack: Option<SlackOptions>,
+    }
+
+    /// One entry in `regex_for_downloads_match`.
+    ///
+    /// Untagged, so a plain string still parses and every config written before
+    /// per-entry rules existed keeps working unchanged -- and `cmd:addtowatchlist`
+    /// keeps appending strings to the same list that `cmd:removewatch` indexes.
+    ///
+    /// TOML round-trips a mixed array losslessly, one entry per line:
+    ///
+    /// ```toml
+    /// regex_for_downloads_match = [
+    ///     "Some Release.*1080p.*",
+    ///     { match = "Star Trek.*2160p.*", require_fields = ["freeleech"] },
+    /// ]
+    /// ```
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(untagged)]
+    pub enum WatchEntry {
+        /// A bare pattern. The global field rules apply to it unchanged.
+        Pattern(String),
+        /// A pattern carrying its own rules, which replace the global ones for
+        /// the fields they name.
+        Detailed {
+            #[serde(rename = "match")]
+            pattern: String,
+            #[serde(default, skip_serializing_if = "Vec::is_empty")]
+            require_fields: Vec<String>,
+            #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+            field_filters: BTreeMap<String, FieldFilter>,
+        },
+    }
+
+    impl WatchEntry {
+        pub fn pattern(&self) -> &str {
+            match self {
+                WatchEntry::Pattern(p) => p,
+                WatchEntry::Detailed { pattern, .. } => pattern,
+            }
+        }
+
+        fn require_fields(&self) -> &[String] {
+            match self {
+                WatchEntry::Pattern(_) => &[],
+                WatchEntry::Detailed { require_fields, .. } => require_fields,
+            }
+        }
+
+        fn field_filters(&self) -> Option<&BTreeMap<String, FieldFilter>> {
+            match self {
+                WatchEntry::Pattern(_) => None,
+                WatchEntry::Detailed { field_filters, .. } => Some(field_filters),
+            }
+        }
+    }
+
+    /// A watch entry with its patterns compiled.
+    #[derive(Debug, Clone)]
+    pub struct CompiledWatch {
+        pub regex: Regex,
+        pub require_fields: Vec<String>,
+        pub field_filters: Vec<(String, CompiledFieldFilter)>,
+    }
+
+    /// A value rule for one captured field.
+    ///
+    /// Both patterns are matched against the field's *values*, so a capture
+    /// with `[captures.<n>].split` set is tested per element -- one tag out of
+    /// a list is enough for either rule to fire.
+    #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+    #[serde(default)]
+    pub struct FieldFilter {
+        /// Take it only if some value matches.
+        ///
+        /// An absent field never matches, so this rejects it -- there is
+        /// nothing to test against.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub matches: Option<String>,
+        /// Drop it if some value matches.
+        ///
+        /// An absent field passes, for the same reason inverted: a rule about
+        /// what a value looks like cannot fire on a value that is not there.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub reject_matching: Option<String>,
+    }
+
+    /// `FieldFilter` with its patterns compiled, held in `LoadedOptions`.
+    ///
+    /// Same reason the other three regex lists are compiled once: these run per
+    /// announcement, and a bad pattern must be a config error rather than a
+    /// panic mid-message.
+    #[derive(Debug, Clone)]
+    pub struct CompiledFieldFilter {
+        pub matches: Option<Regex>,
+        pub reject_matching: Option<Regex>,
     }
 
     fn default_true_role() -> bool {
@@ -379,12 +731,18 @@ pub mod config {
                 platform: PlatformSection::default(),
                 clients: vec![default_client()],
                 command_options: CommandOptions::default(),
-                regex_for_downloads_match: vec!["Some Regex to match.*1080p.*".to_string(), "Another Release.*S02.*1080p.*WEB.*".to_string()],
+                regex_for_downloads_match: vec![
+                    WatchEntry::Pattern("Some Regex to match.*1080p.*".to_string()),
+                    WatchEntry::Pattern("Another Release.*S02.*1080p.*WEB.*".to_string()),
+                ],
                 regex_for_downloads_reject_match: vec![".*NORDIC.*".to_string(), ".*GERMAN.*".to_string()],
                 // An example of the shape, not a working pattern for any
                 // particular network: every tracker announces differently, so
                 // this is the field a user always has to write themselves.
                 regex_for_announce_match: r".*Name:'(?P<name>.*)' uploaded by.*https://tracker\.example\.org/torrent/(?P<id>\d+)".to_string(),
+                require_fields: Vec::new(),
+                captures: BTreeMap::new(),
+                field_filters: BTreeMap::new(),
                 notifications: NotificationOptions::default(),
                 telegram: None,
                 slack: None,
@@ -682,6 +1040,17 @@ pub mod config {
 
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     pub struct rTorrentOptions {
+        /// Tags built from captured fields, written to `d.custom1`.
+        ///
+        /// rTorrent has no category of its own -- `d.custom1` is the one label
+        /// field, and it is what Flood and ruTorrent both show as tags. Flood
+        /// asks for it in its ordinary torrent-list call, so nothing needs
+        /// configuring to see these.
+        ///
+        /// Values are encoded exactly as Flood encodes them, so a tag set here
+        /// is indistinguishable from one set in the UI.
+        #[serde(default)]
+        pub(crate) tags_template: String,
         pub xmlrpc_url: String,
     }
 
@@ -693,6 +1062,7 @@ pub mod config {
                 // path would come out as `/.local/share/rtorrent/rtorrent.sock`.
                 // See the_unix_socket_url_must_not_use_a_double_slash below.
                 xmlrpc_url: "unix:/config/.local/share/rtorrent/rtorrent.sock".to_string(),
+                tags_template: String::new(),
             }
         }
     }
@@ -718,6 +1088,20 @@ pub mod config {
         /// Empty means no category.
         #[serde(default)]
         pub(crate) category: String,
+        /// Tags built from captured fields, e.g. `"{category},{uploader}"`.
+        ///
+        /// qBittorrent's `tags` is comma-separated, and a capture with
+        /// `[captures.<n>].split` set expands straight back into a list -- so
+        /// `"{tags}"` over a `split = ","` capture round-trips.
+        ///
+        /// Empty renders are dropped, so a release missing the field simply
+        /// gets one fewer tag rather than a blank one.
+        #[serde(default)]
+        pub(crate) tags_template: String,
+        /// Category built the same way. Overrides `category` when it renders to
+        /// something non-empty, so the fixed value stays the fallback.
+        #[serde(default)]
+        pub(crate) category_template: String,
     }
 
     // Hand-written Debug so the password cannot reach a log via a stray `{:?}`,
@@ -742,6 +1126,8 @@ pub mod config {
                 password: String::new(),
                 save_path: String::new(),
                 category: String::new(),
+                tags_template: String::new(),
+                category_template: String::new(),
             }
         }
     }
@@ -1331,8 +1717,23 @@ pub mod config {
             self.option_data.lock().unwrap().announce_regex.clone()
         }
 
-        pub fn get_dl_regexes(&self) -> Vec<Regex> {
-            self.option_data.lock().unwrap().dl_regexes.clone()
+        /// Per-capture handling, paired with `get_announce_regex` at both match
+        /// sites. Usually empty, so the clone is a `BTreeMap::new()`.
+        pub fn get_capture_options(&self) -> BTreeMap<String, CaptureOptions> {
+            self.option_data.lock().unwrap().data.captures.clone()
+        }
+
+        pub fn get_require_fields(&self) -> Vec<String> {
+            self.option_data.lock().unwrap().data.require_fields.clone()
+        }
+
+        pub fn get_field_filters(&self) -> Vec<(String, CompiledFieldFilter)> {
+            self.option_data.lock().unwrap().field_filters.clone()
+        }
+
+        /// The download patterns with their per-entry rules attached.
+        pub fn get_dl_watches(&self) -> Vec<CompiledWatch> {
+            self.option_data.lock().unwrap().dl_watches.clone()
         }
 
         pub fn get_reject_regexes(&self) -> Vec<Regex> {
@@ -1394,8 +1795,18 @@ pub mod config {
         /// shows what is actually in the file, and so it reads from the same vec
         /// the index refers to -- the compiled cache is derived from this one and
         /// could not drift, but there is no reason to route a listing through it.
+        /// Just the pattern text, for `cmd:watchlist` and `cmd:removewatch`.
+        /// Positions match `regex_for_downloads_match`, which is what
+        /// `remove_dl_regex` indexes.
         pub fn get_dl_patterns(&self) -> Vec<String> {
-            self.option_data.lock().unwrap().data.regex_for_downloads_match.clone()
+            self.option_data
+                .lock()
+                .unwrap()
+                .data
+                .regex_for_downloads_match
+                .iter()
+                .map(|e| e.pattern().to_string())
+                .collect()
         }
 
         /// `&self`, not `&mut self`: `mutate_options` already takes `&self`, and
@@ -1413,7 +1824,12 @@ pub mod config {
                 error!("Refusing to add an invalid regex '{regex}': {e}");
                 return Err(Error::msg(format!("'{regex}' is not a valid regex: {e}")));
             }
-            self.mutate_options(|data| data.regex_for_downloads_match.push(regex)).await;
+            // Appended as a bare pattern: the global rules apply to it. Per-entry
+            // rules are an options.toml edit, not something a command sets.
+            self.mutate_options(|data| {
+                data.regex_for_downloads_match.push(WatchEntry::Pattern(regex))
+            })
+            .await;
             Ok(())
         }
 
@@ -1693,7 +2109,10 @@ pub mod config {
         fn data_with(announce: &str, dl: Vec<&str>, reject: Vec<&str>) -> OptionData {
             OptionData {
                 regex_for_announce_match: announce.to_string(),
-                regex_for_downloads_match: dl.into_iter().map(String::from).collect(),
+                regex_for_downloads_match: dl
+                    .into_iter()
+                    .map(|p| WatchEntry::Pattern(p.to_string()))
+                    .collect(),
                 regex_for_downloads_reject_match: reject.into_iter().map(String::from).collect(),
                 // ..option_data_for_test(), not ..OptionData::default(): these
                 // cases are about the regexes, and the shipped default has no
@@ -1743,7 +2162,7 @@ pub mod config {
             ))
             .expect("valid patterns should load");
 
-            assert_eq!(loaded.dl_regexes.len(), 2);
+            assert_eq!(loaded.dl_watches.len(), 2);
             assert_eq!(loaded.reject_regexes.len(), 1);
             assert!(loaded.announce_regex.is_match("Name:'Thing' uploaded /torrent/12345"));
         }
@@ -1754,6 +2173,392 @@ pub mod config {
         // `let ... else` rather than expect_err: that would require Debug on
         // LoadedOptions, and the struct holds the whole config -- not something
         // worth making printable just to satisfy a test.
+        /// A valid announce pattern for cases that are not about the announce
+        /// regex. `data_with(".*", ..)` would now be rejected for declaring no
+        /// captures, which would make those tests assert on the wrong error.
+        const VALID_ANNOUNCE: &str = r"(?P<name>.+) /torrent/(?P<id>\d+)";
+
+        #[test]
+        fn an_announce_regex_without_a_name_capture_is_rejected() {
+            let Err(err) =
+                LoadedOptions::from_data(data_with(r"/torrent/(?P<id>\d+)", vec![], vec![]))
+            else {
+                panic!("an announce regex with no `name` group must be rejected");
+            };
+            let err = err.to_string();
+            assert!(err.contains("regex_for_announce_match"), "{err}");
+            assert!(err.contains("(?P<name>"), "should show the shape: {err}");
+            // The error is the only mitigation for a bot that now refuses to
+            // start where it used to panic later, so it must say what *was*
+            // found rather than only what is missing.
+            assert!(err.contains("id"), "should list what was declared: {err}");
+        }
+
+        #[test]
+        fn an_announce_regex_without_an_id_capture_is_rejected() {
+            let Err(err) = LoadedOptions::from_data(data_with(r"(?P<name>.+)", vec![], vec![]))
+            else {
+                panic!("an announce regex with no `id` group must be rejected");
+            };
+            assert!(err.to_string().contains("regex_for_announce_match"), "{err}");
+        }
+
+        #[test]
+        fn an_announce_regex_with_no_named_groups_at_all_says_so() {
+            let Err(err) = LoadedOptions::from_data(data_with(".*", vec![], vec![])) else {
+                panic!("an announce regex with no named groups must be rejected");
+            };
+            assert!(err.to_string().contains("no named groups"), "{err}");
+        }
+
+        #[test]
+        fn a_capture_split_naming_an_undeclared_group_is_rejected() {
+            // The failure this prevents is silent: the field simply never
+            // appears, which looks like the tracker changing its format.
+            let mut data = data_with(VALID_ANNOUNCE, vec![], vec![]);
+            data.captures.insert(
+                "freelech".to_string(),
+                CaptureOptions { split: Some(",".to_string()) },
+            );
+
+            let Err(err) = LoadedOptions::from_data(data) else {
+                panic!("a [captures.*] entry naming no group must be rejected");
+            };
+            let err = err.to_string();
+            assert!(err.contains("captures.freelech"), "{err}");
+            assert!(err.contains("name"), "should list the declared groups: {err}");
+        }
+
+        #[test]
+        fn a_capture_split_naming_a_declared_group_loads() {
+            let mut data = data_with(
+                r"(?P<name>.+) (?P<tags>[^/]+) /torrent/(?P<id>\d+)",
+                vec![],
+                vec![],
+            );
+            data.captures
+                .insert("tags".to_string(), CaptureOptions { split: Some(",".to_string()) });
+
+            assert!(LoadedOptions::from_data(data).is_ok());
+        }
+
+        /// The worst failure this feature can produce, and the reason the check
+        /// is an error rather than a warning: a misspelt field is never on any
+        /// announce line, so every release is skipped and the bot looks like it
+        /// has lost the channel.
+        #[test]
+        fn a_require_fields_typo_is_rejected_rather_than_skipping_everything() {
+            let mut data = data_with(
+                r"(?P<name>.+) (?P<freeleech>free)? /torrent/(?P<id>\d+)",
+                vec![],
+                vec![],
+            );
+            data.require_fields = vec!["freelech".to_string()];
+
+            let Err(err) = LoadedOptions::from_data(data) else {
+                panic!("require_fields naming no capture must be rejected");
+            };
+            let err = err.to_string();
+            assert!(err.contains("require_fields"), "{err}");
+            assert!(err.contains("freelech"), "{err}");
+            assert!(err.contains("skip every release"), "should say why: {err}");
+        }
+
+        #[test]
+        fn require_fields_naming_a_declared_capture_loads() {
+            let mut data = data_with(
+                r"(?P<name>.+)(?P<freeleech> free)? /torrent/(?P<id>\d+)",
+                vec![],
+                vec![],
+            );
+            data.require_fields = vec!["freeleech".to_string()];
+            assert!(LoadedOptions::from_data(data).is_ok());
+        }
+
+        #[test]
+        fn a_field_filter_naming_no_capture_is_rejected() {
+            let mut data = data_with(r"(?P<name>.+) /torrent/(?P<id>\d+)", vec![], vec![]);
+            data.field_filters.insert(
+                "categry".to_string(),
+                FieldFilter { matches: Some("^Movies$".to_string()), reject_matching: None },
+            );
+
+            let Err(err) = LoadedOptions::from_data(data) else {
+                panic!("a field filter naming no capture must be rejected");
+            };
+            assert!(err.to_string().contains("field_filters.categry"), "{err}");
+        }
+
+        #[test]
+        fn an_invalid_field_filter_regex_is_rejected() {
+            let mut data = data_with(
+                r"(?P<name>.+) (?P<category>\w+) /torrent/(?P<id>\d+)",
+                vec![],
+                vec![],
+            );
+            data.field_filters.insert(
+                "category".to_string(),
+                FieldFilter { matches: Some("(unclosed".to_string()), reject_matching: None },
+            );
+
+            let Err(err) = LoadedOptions::from_data(data) else {
+                panic!("an invalid field filter regex must be rejected");
+            };
+            assert!(err.to_string().contains("field_filters.category.matches"), "{err}");
+        }
+
+        #[test]
+        fn field_rules_are_absent_from_a_config_that_does_not_use_them() {
+            let text = toml::to_string_pretty(&OptionData::default()).unwrap();
+            assert!(!text.contains("require_fields"), "{text}");
+            assert!(!text.contains("[field_filters"), "{text}");
+        }
+
+        #[test]
+        fn a_config_with_field_rules_round_trips() {
+            let mut data = option_data_for_test();
+            data.regex_for_announce_match =
+                r"(?P<name>.+) (?P<category>\w+)(?P<freeleech> free)? /torrent/(?P<id>\d+)"
+                    .to_string();
+            data.require_fields = vec!["freeleech".to_string()];
+            data.field_filters.insert(
+                "category".to_string(),
+                FieldFilter {
+                    matches: Some("^Movies$".to_string()),
+                    reject_matching: Some("^XXX$".to_string()),
+                },
+            );
+
+            let text = toml::to_string_pretty(&data).unwrap();
+            let back: OptionData = toml::from_str(&text).expect("round trip");
+            assert_eq!(back, data, "rendered as:\n{text}");
+        }
+
+        #[test]
+        fn a_bare_pattern_and_a_detailed_entry_share_one_list() {
+            // Backward compatibility is the point: a config written before
+            // per-entry rules existed parses unchanged, and both forms coexist.
+            let text = r#"
+                regex_for_downloads_match = [
+                    "Some Release.*1080p.*",
+                    { match = "Star Trek.*2160p.*", require_fields = ["freeleech"] },
+                ]
+            "#;
+            #[derive(serde_derive::Deserialize)]
+            struct Just {
+                regex_for_downloads_match: Vec<WatchEntry>,
+            }
+            let parsed: Just = toml::from_str(text).expect("mixed array should parse");
+            assert_eq!(parsed.regex_for_downloads_match.len(), 2);
+            assert_eq!(
+                parsed.regex_for_downloads_match[0],
+                WatchEntry::Pattern("Some Release.*1080p.*".to_string())
+            );
+            assert_eq!(parsed.regex_for_downloads_match[1].pattern(), "Star Trek.*2160p.*");
+        }
+
+        #[test]
+        fn a_detailed_entry_round_trips() {
+            // mutate_options rewrites the whole file on cmd:addtowatchlist, so
+            // an entry that does not survive to_string_pretty would be
+            // destroyed by an unrelated command.
+            let mut data = option_data_for_test();
+            data.regex_for_announce_match =
+                r"(?P<name>.+)(?P<freeleech> free)? /torrent/(?P<id>\d+)".to_string();
+            data.regex_for_downloads_match = vec![
+                WatchEntry::Pattern("Plain.*1080p.*".to_string()),
+                WatchEntry::Detailed {
+                    pattern: "Star Trek.*2160p.*".to_string(),
+                    require_fields: vec!["freeleech".to_string()],
+                    field_filters: BTreeMap::new(),
+                },
+            ];
+
+            let text = toml::to_string_pretty(&data).unwrap();
+            let back: OptionData = toml::from_str(&text).expect("round trip");
+            assert_eq!(back, data, "rendered as:\n{text}");
+        }
+
+        #[test]
+        fn an_entry_rule_naming_no_capture_is_rejected_and_names_the_entry() {
+            let mut data = data_with(r"(?P<name>.+) /torrent/(?P<id>\d+)", vec![], vec![]);
+            data.regex_for_downloads_match = vec![WatchEntry::Detailed {
+                pattern: "Star Trek.*".to_string(),
+                require_fields: vec!["freelech".to_string()],
+                field_filters: BTreeMap::new(),
+            }];
+
+            let Err(err) = LoadedOptions::from_data(data) else {
+                panic!("an entry rule naming no capture must be rejected");
+            };
+            let err = err.to_string();
+            assert!(err.contains("Star Trek.*"), "should name the entry: {err}");
+            assert!(err.contains("freelech"), "{err}");
+        }
+
+        #[test]
+        fn an_invalid_entry_filter_regex_is_rejected() {
+            let mut data = data_with(
+                r"(?P<name>.+) (?P<category>\w+) /torrent/(?P<id>\d+)",
+                vec![],
+                vec![],
+            );
+            let mut filters = BTreeMap::new();
+            filters.insert(
+                "category".to_string(),
+                FieldFilter { matches: Some("(unclosed".to_string()), reject_matching: None },
+            );
+            data.regex_for_downloads_match = vec![WatchEntry::Detailed {
+                pattern: "Star Trek.*".to_string(),
+                require_fields: Vec::new(),
+                field_filters: filters,
+            }];
+
+            let Err(err) = LoadedOptions::from_data(data) else {
+                panic!("an invalid entry filter regex must be rejected");
+            };
+            assert!(err.to_string().contains("Star Trek.*"), "{err}");
+        }
+
+        #[test]
+        fn a_client_template_naming_no_capture_is_rejected() {
+            let mut data = data_with(r"(?P<name>.+) /torrent/(?P<id>\d+)", vec![], vec![]);
+            data.clients = vec![TorrentClientOption::QBittorrent(QBittorrentOptions {
+                tags_template: "{uploader}".to_string(),
+                ..QBittorrentOptions::default()
+            })];
+
+            let Err(err) = LoadedOptions::from_data(data) else {
+                panic!("a tags_template naming no capture must be rejected");
+            };
+            let err = err.to_string();
+            assert!(err.contains("tags_template"), "{err}");
+            assert!(err.contains("uploader"), "{err}");
+        }
+
+        #[test]
+        fn an_rtorrent_template_naming_no_capture_is_rejected() {
+            let mut data = data_with(r"(?P<name>.+) /torrent/(?P<id>\d+)", vec![], vec![]);
+            data.clients = vec![TorrentClientOption::rTorrent(rTorrentOptions {
+                tags_template: "{uploader}".to_string(),
+                ..rTorrentOptions::default()
+            })];
+
+            let Err(err) = LoadedOptions::from_data(data) else {
+                panic!("an rTorrent tags_template naming no capture must be rejected");
+            };
+            let err = err.to_string();
+            assert!(err.contains("[clients.rTorrent] tags_template"), "{err}");
+            assert!(err.contains("uploader"), "{err}");
+        }
+
+        #[test]
+        fn a_client_template_naming_a_declared_capture_loads() {
+            let mut data = data_with(
+                r"(?P<name>.+) (?P<uploader>\w+) /torrent/(?P<id>\d+)",
+                vec![],
+                vec![],
+            );
+            data.clients = vec![TorrentClientOption::QBittorrent(QBittorrentOptions {
+                tags_template: "{uploader}".to_string(),
+                category_template: "{uploader}".to_string(),
+                ..QBittorrentOptions::default()
+            })];
+            assert!(LoadedOptions::from_data(data).is_ok());
+        }
+
+        #[test]
+        fn a_capture_named_key_warns_but_still_loads() {
+            // Reserved-wins makes it confusing, not exploitable, and rejecting
+            // would break a config where the group is merely unused.
+            let data = data_with(
+                r"(?P<name>.+) (?P<key>\w+) /torrent/(?P<id>\d+)",
+                vec![],
+                vec![],
+            );
+            assert!(LoadedOptions::from_data(data).is_ok());
+        }
+
+        #[test]
+        fn captures_are_absent_from_a_config_that_does_not_use_them() {
+            // skip_serializing_if: the file `cmd:addtowatchlist` rewrites must
+            // not sprout an empty table for the many users who never set one.
+            let text = toml::to_string_pretty(&OptionData::default()).unwrap();
+            assert!(!text.contains("[captures"), "{text}");
+        }
+
+        #[test]
+        fn a_config_with_captures_round_trips() {
+            let mut data = option_data_for_test();
+            data.regex_for_announce_match =
+                r"(?P<name>.+) (?P<tags>[^/]+) /torrent/(?P<id>\d+)".to_string();
+            data.captures
+                .insert("tags".to_string(), CaptureOptions { split: Some(", ".to_string()) });
+
+            let text = toml::to_string_pretty(&data).unwrap();
+            let back: OptionData = toml::from_str(&text).expect("round trip");
+            assert_eq!(back, data, "rendered as:\n{text}");
+        }
+
+        /// Build a config with a given announce regex and download template.
+        fn data_with_template(announce: &str, template: &str) -> OptionData {
+            let mut data = option_data_for_test();
+            data.regex_for_announce_match = announce.to_string();
+            data.platform.options.download_url_template = template.to_string();
+            data.platform.options.rss_key = "KEY".to_string();
+            data
+        }
+
+        #[test]
+        fn a_template_placeholder_must_name_a_declared_capture() {
+            // url_template can no longer tell an unknown placeholder from a
+            // valid one -- "valid" depends on a regex it never sees. This check
+            // is therefore load-bearing, not a convenience.
+            let Err(err) = LoadedOptions::from_data(data_with_template(
+                r"(?P<name>.+)/torrent/(?P<id>\d+)",
+                "https://h.example/dl/{id}/{uploader}",
+            )) else {
+                panic!("a placeholder naming no capture must be rejected");
+            };
+            let err = err.to_string();
+            assert!(err.contains("{uploader}"), "{err}");
+            assert!(err.contains("regex_for_announce_match"), "{err}");
+            assert!(err.contains("name"), "should list the declared captures: {err}");
+        }
+
+        #[test]
+        fn a_template_placeholder_naming_a_declared_capture_loads() {
+            assert!(LoadedOptions::from_data(data_with_template(
+                r"(?P<name>.+) by '(?P<uploader>[^']+)'.*/torrent/(?P<id>\d+)",
+                "https://h.example/dl/{id}/{uploader}/{file}?k={key}",
+            ))
+            .is_ok());
+        }
+
+        #[test]
+        fn file_and_key_never_need_declaring() {
+            // They are supplied by the download layer, not the announce line.
+            assert!(LoadedOptions::from_data(data_with_template(
+                r"(?P<name>.+)/torrent/(?P<id>\d+)",
+                "https://h.example/dl/{id}/{file}?k={key}",
+            ))
+            .is_ok());
+        }
+
+        #[test]
+        fn a_template_placeholder_in_the_authority_is_still_rejected() {
+            // The property that matters most, now that names are open-ended:
+            // reaching validate_platform at all means url_template accepted the
+            // name, so this has to fail on position rather than spelling.
+            let Err(err) = LoadedOptions::from_data(data_with_template(
+                r"(?P<name>.+) by '(?P<uploader>[^']+)'.*/torrent/(?P<id>\d+)",
+                "https://{uploader}.example/dl/{id}",
+            )) else {
+                panic!("a placeholder in the authority must be rejected");
+            };
+            assert!(err.to_string().contains("host or port"), "{err}");
+        }
+
         #[test]
         fn an_invalid_announce_regex_is_rejected() {
             let Err(err) = LoadedOptions::from_data(data_with("(unclosed", vec![], vec![])) else {
@@ -1992,7 +2797,8 @@ pub mod config {
                 text.contains("regex_for_downloads_match = [\n"),
                 "the list should open onto its own line:\n{text}"
             );
-            for pattern in &OptionData::default().regex_for_downloads_match {
+            for entry in &OptionData::default().regex_for_downloads_match {
+                let pattern = entry.pattern();
                 assert!(
                     text.contains(&format!("    \"{pattern}\",\n")),
                     "'{pattern}' should be on its own indented line:\n{text}"

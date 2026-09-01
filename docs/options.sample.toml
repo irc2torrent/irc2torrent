@@ -37,7 +37,106 @@ regex_for_downloads_reject_match = [
 # How to pull the release name and torrent id out of an announce line. The two
 # named captures `name` and `id` are required; the rest depends on your
 # network's announce format. This is the one you will have to write yourself.
+#
+# Startup fails if `name` or `id` is missing, naming the field -- it used to
+# match, then panic on the first announcement instead.
 regex_for_announce_match = '''.*Name:'(?P<name>.*)' uploaded by.*https://tracker.example.org/torrent/(?P<id>\d+)'''
+
+# EVERY OTHER NAMED CAPTURE BECOMES AN OPTIONAL FIELD.
+#
+# Your announce line almost certainly carries more than a name and an id --
+# a category, who uploaded it, a freeleech marker. Name a group and it is
+# captured; nothing here is tracker-specific, so a network with entirely
+# different metadata works the same way.
+#
+# A fuller pattern for a line like:
+#
+#   New Torrent Announcement: <Movies :: 4K>  Name:'Some Release 2160p'
+#   uploaded by 'someone' freeleech -  https://tracker.example.org/torrent/1234
+#
+# regex_for_announce_match = '''<(?P<category>[^:]+) :: (?P<subcategory>[^>]+)>\s+Name:'(?P<name>.*)' uploaded by '(?P<uploader>[^']+)'(?P<freeleech> freeleech)?.*/torrent/(?P<id>\d+)'''
+#
+# Two things worth knowing:
+#
+#   * A group wrapped in `?` is a MARKER. `(?P<freeleech> freeleech)?` captures
+#     only when the word is on the line, so "is this freeleech" is simply
+#     whether the field is there at all.
+#   * `file` and `key` are reserved for download_url_template and are ignored
+#     if you name a capture after them. You get a warning, not an error.
+#
+# Use them in download_url_template below, and to filter -- see the two
+# sections that follow.
+
+# ---------------------------------------------------------------------------
+# Filtering on captured fields
+# ---------------------------------------------------------------------------
+#
+# These run only AFTER regex_for_downloads_match has already said yes, so they
+# narrow what you asked for rather than widening it. A release nothing asked
+# for is still just "not wanted"; these never make it look like a field problem.
+#
+# Every field named here must be a group your regex declares -- a typo would
+# otherwise skip every release and look exactly like a dead announce channel,
+# so it is a startup error.
+#
+# RULES CAN BE PER PATTERN. An entry in regex_for_downloads_match above may be
+# a plain string, as it always was, or a table with its own rules:
+#
+# regex_for_downloads_match = [
+#     "Some Release.*1080p.*",
+#     { match = "Star Trek.*2160p.*", require_fields = ["freeleech"] },
+# ]
+#
+# So "only the 4K stuff if it is freeleech, anything for the rest" is
+# expressible. Bare strings keep working, and cmd:addtowatchlist still adds one.
+#
+# How the two levels compose:
+#
+#   1. regex_for_downloads_reject_match wins first, always.
+#   2. A field a matching entry names is that entry's to decide -- the global
+#      rule for it is dropped, not added to. Otherwise a blanket require_fields
+#      would overrule a line that deliberately says "this one either way".
+#   3. Global rules still apply to fields no matching entry mentions.
+#   4. Where several matching entries name the same field, all of their rules
+#      must pass.
+
+# The global default. Fields that must have captured, or the release is
+# skipped -- "only take freeleech" is one line, given a `(?P<freeleech>...)?`
+# group:
+#
+# require_fields = ["freeleech"]
+
+# ---------------------------------------------------------------------------
+# Per-field value rules
+# ---------------------------------------------------------------------------
+#
+# Both patterns test the field's VALUES, so a capture with a `split` set is
+# tested per element -- one tag out of a list is enough for either to fire.
+#
+# An absent field answers the two oppositely, and neither answer is arbitrary:
+# `matches` rejects it (there is nothing to match against) while
+# `reject_matching` passes it (a rule about what a value looks like cannot fire
+# on a value that is not there). Use require_fields if you want presence.
+#
+# [field_filters.category]
+# matches = "^Movies$"
+#
+# [field_filters.uploader]
+# reject_matching = "^(?i)anonymous$"
+
+# ---------------------------------------------------------------------------
+# Splitting a capture into several values
+# ---------------------------------------------------------------------------
+#
+# Only needed when the COUNT is unknown, such as a comma-separated tag list.
+# Two fixed sub-values are better written as two groups -- the `category` and
+# `subcategory` above need nothing here.
+#
+# Values are trimmed and empty ones dropped, so "hd, remux ," yields two.
+# The unsplit text is kept as-is for the download URL.
+#
+# [captures.tags]
+# split = ","
 
 # ---------------------------------------------------------------------------
 # Tracker
@@ -52,14 +151,24 @@ regex_for_announce_match = '''.*Name:'(?P<name>.*)' uploaded by.*https://tracker
 # else's site. Copy the URL your tracker's "download" button produces and
 # replace the varying parts with placeholders:
 #
-#   {id}    the `id` capture from regex_for_announce_match
-#   {name}  the `name` capture, verbatim from IRC
 #   {file}  the sanitised filename actually written to torrent_dir,
 #           ".torrent" included
 #   {key}   rss_key, below
 #
-# Write `{{` or `}}` for a literal brace. Anything else in braces is an error at
-# startup rather than a 404 later.
+# Those two are always available. EVERY OTHER PLACEHOLDER IS ONE OF YOUR
+# CAPTURES -- {id} and {name} are not special, they simply happen to be the two
+# groups every config declares. If your regex names an `authkey` group, then
+# `{authkey}` works here too:
+#
+#   download_url_template = "https://tracker.example.org/download/{id}/{authkey}/{file}"
+#
+# A placeholder naming a group your regex does not declare is a startup error
+# listing what it does declare, rather than a 404 later. Write `{{` or `}}` for
+# a literal brace.
+#
+# Placeholders are never allowed in the host, userinfo or port -- they are
+# filled from IRC messages, and a release name that could move the host would
+# send your rss_key to somebody else's server. Path, query and fragment only.
 #
 # {name} and {id} come straight off IRC, so every substituted value is
 # percent-encoded and the host is re-checked before the request goes out — a
@@ -100,6 +209,22 @@ torrent_dir = "/downloads/.torrents"
 # loses it.
 xmlrpc_url = "unix:/config/.local/share/rtorrent/rtorrent.sock"
 
+# Tags built from the captures in your announce regex, written to `d.custom1`.
+#
+# rTorrent has no category of its own: d.custom1 is the single label field, and
+# it is what Flood and ruTorrent both show as tags. Flood asks for it in its
+# ordinary torrent-list call, so nothing needs configuring to see these — and
+# they are encoded exactly as Flood encodes them, so a tag set here is
+# indistinguishable from one you set in the UI.
+#
+# Commas separate tags, so a capture with `split = ","` expands into a list. A
+# comma *inside* a value is encoded rather than treated as a separator.
+#
+# A placeholder naming a group your regex does not declare is a startup error.
+# Setting this overwrites whatever tags the torrent already has.
+#
+# tags_template = "{category},{uploader}"
+
 # qBittorrent instead — put this block first, or delete the rTorrent one.
 #
 # [[clients]]
@@ -118,6 +243,20 @@ xmlrpc_url = "unix:/config/.local/share/rtorrent/rtorrent.sock"
 # Empty means whatever qBittorrent is already configured to use.
 # save_path = ""
 # category  = ""
+#
+# Tags and category built from the captures in your announce regex. qBittorrent
+# tags are comma-separated, and a capture with `split` set expands straight back
+# into a list -- so "{tags}" over a `split = ","` capture round-trips.
+#
+# A placeholder whose capture did not fire renders empty and the field is simply
+# not sent, so a release with no uploader gets one fewer tag rather than a blank
+# one. category_template overrides `category` above only when it renders to
+# something, so the fixed value stays the fallback.
+#
+# A placeholder naming a group your regex does not declare is a startup error.
+#
+# tags_template     = "{category},{uploader}"
+# category_template = "{category}"
 
 # ---------------------------------------------------------------------------
 # Commands over IRC

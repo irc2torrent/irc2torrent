@@ -26,6 +26,8 @@ use anyhow::Error;
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use reqwest::Url;
 
+use crate::template::{lex, FieldSource, Part};
+
 /// RFC 3986 "unreserved": `ALPHA / DIGIT / "-" / "." / "_" / "~"`.
 ///
 /// Everything else is escaped, which is what makes a substituted value unable to
@@ -39,80 +41,49 @@ const UNRESERVED: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'_')
     .remove(b'~');
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Field {
-    Id,
-    Name,
-    File,
-    Key,
+/// Placeholders the download layer supplies itself, whatever the announce
+/// regex declares. Everything else must be a named capture.
+pub(crate) const RESERVED: [&str; 2] = ["file", "key"];
+
+const PLACEHOLDER_HELP: &str = "`{file}` and `{key}` are always available; any other placeholder \
+     must name a capture group in regex_for_announce_match";
+
+/// Stand-in prefix used only while validating the template.
+const PROBE_PREFIX: &str = "qqzzprobe";
+
+/// A probe for placeholder `idx`.
+///
+/// Built from a fixed alphabet rather than from the placeholder's own name, so
+/// it is lowercase alphanumeric **by construction** for any name a user picks.
+/// That is what makes the authority scan meaningful: a probe survives both URL
+/// parsing and `UNRESERVED` encoding unchanged, so finding one in the authority
+/// proves the placeholder sits somewhere substitution can never be made safe.
+///
+/// The trailing `q` is a terminator: without it `{a}`'s probe would be a prefix
+/// of `{ab}`'s and an authority error could name the wrong placeholder.
+fn probe_for(prefix: &str, idx: usize) -> String {
+    format!("{prefix}{idx}q")
 }
 
-impl Field {
-    fn from_name(s: &str) -> Option<Self> {
-        match s {
-            "id" => Some(Self::Id),
-            "name" => Some(Self::Name),
-            "file" => Some(Self::File),
-            "key" => Some(Self::Key),
-            _ => None,
-        }
+/// A probe prefix that does not already occur in the template's literal text.
+///
+/// A template that happens to contain `qqzzprobe` would otherwise make the
+/// authority scan blame a placeholder that is not there. Fails closed either
+/// way -- only the message would be wrong -- but the literal is finite, so
+/// lengthening until it cannot collide is cheap and terminates.
+fn probe_prefix_for(literals: &str) -> String {
+    let mut prefix = PROBE_PREFIX.to_string();
+    while literals.contains(&prefix) {
+        prefix.insert(1, 'q');
     }
-
-    /// A stand-in used only while validating the template.
-    ///
-    /// Alphanumeric, so it survives both URL parsing and `UNRESERVED` encoding
-    /// unchanged -- if one of these turns up in the authority of the probe URL,
-    /// the placeholder it came from is in a position substitution can never be
-    /// made safe in.
-    fn probe(self) -> &'static str {
-        match self {
-            Self::Id => "qqzzprobeid",
-            Self::Name => "qqzzprobename",
-            Self::File => "qqzzprobefile",
-            Self::Key => "qqzzprobekey",
-        }
-    }
-
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Id => "id",
-            Self::Name => "name",
-            Self::File => "file",
-            Self::Key => "key",
-        }
-    }
-}
-
-const VALID_PLACEHOLDERS: &str = "{id}, {name}, {file}, {key}";
-
-#[derive(Debug)]
-enum Part {
-    Literal(String),
-    Field(Field),
-}
-
-/// The values substituted for one download.
-pub(crate) struct Fields<'a> {
-    pub id: &'a str,
-    pub name: &'a str,
-    pub file: &'a str,
-    pub key: &'a str,
-}
-
-impl Fields<'_> {
-    fn get(&self, f: Field) -> &str {
-        match f {
-            Field::Id => self.id,
-            Field::Name => self.name,
-            Field::File => self.file,
-            Field::Key => self.key,
-        }
-    }
+    prefix
 }
 
 #[derive(Debug)]
 pub(crate) struct UrlTemplate {
     parts: Vec<Part>,
+    /// Distinct placeholder names, in first-use order. `Part::Field` indexes it.
+    names: Vec<String>,
     /// Scheme + userinfo + host + port of the template, captured at parse time.
     /// `render` refuses to return a URL whose authority differs from this.
     authority: String,
@@ -136,25 +107,33 @@ fn authority_of(u: &Url) -> String {
 impl UrlTemplate {
     pub fn parse(template: &str) -> Result<Self, Error> {
         if template.trim().is_empty() {
-            return Err(Error::msg(
+            return Err(Error::msg(format!(
                 "download_url_template is empty; set it to the URL your tracker \
-                 serves .torrent files from, using the placeholders "
-                    .to_string()
-                    + VALID_PLACEHOLDERS,
-            ));
+                 serves .torrent files from. {PLACEHOLDER_HELP}"
+            )));
         }
 
-        let parts = lex(template)?;
-        let uses_key = parts
+        let (parts, names) = lex(template, "download_url_template")?;
+        let uses_key = names.iter().any(|n| n == "key");
+
+        // Probes are generated against the template's literal text so they
+        // cannot collide with it -- see `probe_prefix_for`.
+        let literals: String = parts
             .iter()
-            .any(|p| matches!(p, Part::Field(Field::Key)));
+            .filter_map(|p| match p {
+                Part::Literal(s) => Some(s.as_str()),
+                Part::Field(_) => None,
+            })
+            .collect();
+        let prefix = probe_prefix_for(&literals);
+        let probes: Vec<String> = (0..names.len()).map(|i| probe_for(&prefix, i)).collect();
 
         // Substitute inert stand-ins and see what kind of URL this actually is.
         let probe: String = parts
             .iter()
             .map(|p| match p {
                 Part::Literal(s) => s.as_str(),
-                Part::Field(f) => f.probe(),
+                Part::Field(i) => probes[*i].as_str(),
             })
             .collect();
 
@@ -182,18 +161,18 @@ impl UrlTemplate {
         // A placeholder in the authority cannot be made safe by escaping: the
         // value would choose the server the rss_key is sent to.
         let authority = authority_of(&url);
-        for f in [Field::Id, Field::Name, Field::File, Field::Key] {
-            if authority.contains(f.probe()) {
+        for (i, p) in probes.iter().enumerate() {
+            if authority.contains(p.as_str()) {
                 return Err(Error::msg(format!(
                     "download_url_template puts {{{}}} in the host or port. \
                      Placeholders are filled from IRC messages, so they are only \
                      allowed in the path, query or fragment.",
-                    f.as_str()
+                    names[i]
                 )));
             }
         }
 
-        Ok(Self { parts, authority, uses_key })
+        Ok(Self { parts, names, authority, uses_key })
     }
 
     /// Whether the template mentions `{key}`, and so needs a non-empty `rss_key`.
@@ -201,21 +180,48 @@ impl UrlTemplate {
         self.uses_key
     }
 
-    pub fn render(&self, fields: Fields<'_>) -> Result<String, Error> {
+    /// Distinct placeholder names, for the config layer to check against the
+    /// announce regex's captures.
+    ///
+    /// That check is load-bearing rather than a convenience: this module can no
+    /// longer tell an unknown placeholder from a valid one, because "valid"
+    /// now depends on a regex it never sees. See `validate_platform`.
+    pub fn placeholder_names(&self) -> &[String] {
+        &self.names
+    }
+
+    pub fn render(&self, fields: &impl FieldSource) -> Result<String, Error> {
         let mut out = String::new();
         for part in &self.parts {
             match part {
                 Part::Literal(s) => out.push_str(s),
-                Part::Field(f) => {
-                    let raw = fields.get(*f);
+                Part::Field(i) => {
+                    let name = &self.names[*i];
+                    // Hard error, never an empty substitution. The config
+                    // cross-check should have made this unreachable, so getting
+                    // here means that proof was bypassed -- and a refused
+                    // download is a far better failure than a URL built with a
+                    // hole in it.
+                    let Some(raw) = fields.get(name) else {
+                        return Err(Error::msg(format!(
+                            "refusing to build a download URL: {{{name}}} has no value. \
+                             It must name a capture that participated in the announce line."
+                        )));
+                    };
                     // `.` and `..` are the one thing escaping does not neutralise:
                     // they stay unreserved and a whole segment of ".." is removed
-                    // by path normalisation, shifting everything after it.
+                    // by path normalisation, shifting everything after it. An
+                    // empty value is the same hazard from the other direction --
+                    // `/a/{x}/b` collapses to `/a//b`, a different path.
+                    if raw.is_empty() {
+                        return Err(Error::msg(format!(
+                            "refusing to build a download URL: {{{name}}} is empty, which \
+                             would collapse a path segment"
+                        )));
+                    }
                     if raw == "." || raw == ".." {
                         return Err(Error::msg(format!(
-                            "refusing to build a download URL: {{{}}} is {:?}",
-                            f.as_str(),
-                            raw
+                            "refusing to build a download URL: {{{name}}} is {raw:?}"
                         )));
                     }
                     out.extend(utf8_percent_encode(raw, UNRESERVED));
@@ -243,76 +249,40 @@ impl UrlTemplate {
     }
 }
 
-/// Split a template into literals and placeholders.
-///
-/// `{{` and `}}` are literal braces, so a tracker whose URLs genuinely contain
-/// one is still expressible.
-fn lex(template: &str) -> Result<Vec<Part>, Error> {
-    let mut parts = Vec::new();
-    let mut literal = String::new();
-    let mut chars = template.chars().peekable();
-
-    while let Some(c) = chars.next() {
-        match c {
-            '{' if chars.peek() == Some(&'{') => {
-                chars.next();
-                literal.push('{');
-            }
-            '}' if chars.peek() == Some(&'}') => {
-                chars.next();
-                literal.push('}');
-            }
-            '}' => {
-                return Err(Error::msg(
-                    "download_url_template has a `}` with no matching `{`; \
-                     write `}}` for a literal brace",
-                ))
-            }
-            '{' => {
-                let mut name = String::new();
-                let mut closed = false;
-                for c in chars.by_ref() {
-                    if c == '}' {
-                        closed = true;
-                        break;
-                    }
-                    name.push(c);
-                }
-                if !closed {
-                    return Err(Error::msg(format!(
-                        "download_url_template has an unterminated `{{{name}`; \
-                         valid placeholders are {VALID_PLACEHOLDERS}"
-                    )));
-                }
-                let field = Field::from_name(&name).ok_or_else(|| {
-                    Error::msg(format!(
-                        "download_url_template uses an unknown placeholder \
-                         `{{{name}}}`; valid placeholders are {VALID_PLACEHOLDERS}"
-                    ))
-                })?;
-                if !literal.is_empty() {
-                    parts.push(Part::Literal(std::mem::take(&mut literal)));
-                }
-                parts.push(Part::Field(field));
-            }
-            _ => literal.push(c),
-        }
-    }
-
-    if !literal.is_empty() {
-        parts.push(Part::Literal(literal));
-    }
-    Ok(parts)
-}
 
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::template::MAX_NAME;
 
     const TPL: &str = "https://tracker.example.org/rss/download/{id}/{key}/{file}";
 
-    fn fields<'a>(id: &'a str, name: &'a str, file: &'a str, key: &'a str) -> Fields<'a> {
-        Fields { id, name, file, key }
+    /// A `FieldSource` backed by a plain map.
+    ///
+    /// Replaces the fixed four-field struct these tests used to build. The
+    /// call sites below are unchanged on purpose: this module is the security
+    /// spec for the download URL, so the generalisation has to leave every
+    /// existing assertion passing verbatim.
+    struct TestFields(std::collections::BTreeMap<String, String>);
+
+    impl FieldSource for TestFields {
+        fn get(&self, name: &str) -> Option<&str> {
+            self.0.get(name).map(String::as_str)
+        }
+    }
+
+    fn fields(id: &str, name: &str, file: &str, key: &str) -> TestFields {
+        TestFields(
+            [("id", id), ("name", name), ("file", file), ("key", key)]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        )
+    }
+
+    /// A source carrying only what is listed, for the missing-value paths.
+    fn only(pairs: &[(&str, &str)]) -> TestFields {
+        TestFields(pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect())
     }
 
     #[test]
@@ -320,7 +290,7 @@ mod test {
         let t = UrlTemplate::parse("https://hypo.example/download/{id}/{file}?passkey={key}&n={name}")
             .unwrap();
         let url = t
-            .render(fields("8f3c1a2b", "Some.Release", "Some.Release.torrent", "abcd1234"))
+            .render(&fields("8f3c1a2b", "Some.Release", "Some.Release.torrent", "abcd1234"))
             .unwrap();
         assert_eq!(
             url,
@@ -335,12 +305,106 @@ mod test {
     }
 
     #[test]
-    fn an_unknown_placeholder_is_rejected_at_parse() {
-        for bad in ["https://h.example/{ids}", "https://h.example/{Id}", "https://h.example/{}"] {
-            let e = UrlTemplate::parse(bad).unwrap_err().to_string();
-            assert!(e.contains("unknown placeholder"), "{bad}: {e}");
-            assert!(e.contains("{id}"), "{bad}: {e}");
-        }
+    fn a_malformed_placeholder_name_is_rejected_at_parse() {
+        // `{ids}` and `{Id}` used to be rejected here as "unknown"; they are now
+        // syntactically fine and it is the config layer, which can see the
+        // announce regex, that decides whether they name a real capture.
+        // What this module still rejects is a name that could not *be* a
+        // capture name.
+        let e = UrlTemplate::parse("https://h.example/{}").unwrap_err().to_string();
+        assert!(e.contains("empty placeholder"), "{e}");
+
+        let e = UrlTemplate::parse("https://h.example/{a-b}").unwrap_err().to_string();
+        assert!(e.contains("letters, digits and underscore"), "{e}");
+
+        let e = UrlTemplate::parse("https://h.example/{ünïcode}").unwrap_err().to_string();
+        assert!(e.contains("letters, digits and underscore"), "{e}");
+
+        let long = "x".repeat(MAX_NAME + 1);
+        let e = UrlTemplate::parse(&format!("https://h.example/{{{long}}}"))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("longer than"), "{e}");
+    }
+
+    #[test]
+    fn an_arbitrary_placeholder_name_is_accepted() {
+        let t = UrlTemplate::parse("https://h.example/{uploader}/{id}").unwrap();
+        assert_eq!(t.placeholder_names(), ["uploader", "id"]);
+
+        let url = t
+            .render(&only(&[("uploader", "j3rico"), ("id", "42")]))
+            .unwrap();
+        assert_eq!(url, "https://h.example/j3rico/42");
+    }
+
+    #[test]
+    fn an_arbitrary_placeholder_cannot_sit_in_the_authority() {
+        // The property the whole module exists for, now that names are open.
+        let e = UrlTemplate::parse("https://{uploader}.example/d")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("host or port"), "{e}");
+        assert!(e.contains("{uploader}"), "the error must name the placeholder: {e}");
+    }
+
+    #[test]
+    fn names_sharing_a_prefix_are_attributed_correctly() {
+        // Index-based probes with a terminator: without the trailing sentinel
+        // `{a}`'s probe would be a substring of `{ab}`'s and this would blame
+        // the wrong one.
+        // Both in the path/query: accepted, and neither shadows the other.
+        let t = UrlTemplate::parse("https://h.example/{a}?x={ab}").unwrap();
+        assert_eq!(t.placeholder_names(), ["a", "ab"]);
+        let url = t.render(&only(&[("a", "1"), ("ab", "2")])).unwrap();
+        assert_eq!(url, "https://h.example/1?x=2");
+
+        // Only the longer one is in the authority, and only it is blamed.
+        let e = UrlTemplate::parse("https://{ab}.example/{a}").unwrap_err().to_string();
+        assert!(e.contains("{ab}"), "{e}");
+    }
+
+    #[test]
+    fn a_repeated_placeholder_is_interned_once() {
+        let t = UrlTemplate::parse("https://h.example/{id}/x/{id}").unwrap();
+        assert_eq!(t.placeholder_names(), ["id"]);
+        let url = t.render(&only(&[("id", "7")])).unwrap();
+        assert_eq!(url, "https://h.example/7/x/7");
+    }
+
+    #[test]
+    fn a_probe_never_reaches_the_rendered_url() {
+        let t = UrlTemplate::parse("https://h.example/{id}/{name}/{file}?k={key}").unwrap();
+        let url = t.render(&fields("1", "n", "f", "k")).unwrap();
+        assert!(!url.contains(PROBE_PREFIX), "{url}");
+    }
+
+    #[test]
+    fn a_literal_that_looks_like_a_probe_does_not_break_attribution() {
+        // The prefix is lengthened until it cannot collide with the literal, so
+        // this template is accepted rather than falsely blamed.
+        let t = UrlTemplate::parse("https://h.example/qqzzprobe0q/{id}").unwrap();
+        let url = t.render(&only(&[("id", "7")])).unwrap();
+        assert_eq!(url, "https://h.example/qqzzprobe0q/7");
+    }
+
+    #[test]
+    fn a_placeholder_with_no_value_is_refused() {
+        // Hard error, never an empty substitution: the config cross-check makes
+        // this unreachable, so reaching it means that proof was bypassed.
+        let t = UrlTemplate::parse("https://h.example/{id}/{freeleech}").unwrap();
+        let e = t.render(&only(&[("id", "7")])).unwrap_err().to_string();
+        assert!(e.contains("{freeleech}"), "{e}");
+        assert!(e.contains("no value"), "{e}");
+    }
+
+    #[test]
+    fn an_empty_value_is_refused() {
+        // `/a/{x}/b` would collapse to `/a//b`, a different path. Also a latent
+        // fix for the fixed fields: `(?P<name>.*)` can match empty.
+        let t = UrlTemplate::parse("https://h.example/{id}/x").unwrap();
+        let e = t.render(&only(&[("id", "")])).unwrap_err().to_string();
+        assert!(e.contains("empty"), "{e}");
     }
 
     #[test]
@@ -358,7 +422,7 @@ mod test {
     #[test]
     fn doubled_braces_are_literal() {
         let t = UrlTemplate::parse("https://h.example/{{id}}/{id}").unwrap();
-        let url = t.render(fields("7", "n", "f", "k")).unwrap();
+        let url = t.render(&fields("7", "n", "f", "k")).unwrap();
         assert_eq!(url, "https://h.example/%7Bid%7D/7");
     }
 
@@ -396,7 +460,7 @@ mod test {
     fn an_announce_name_cannot_change_the_host() {
         let t = UrlTemplate::parse(TPL).unwrap();
         let url = t
-            .render(fields("1", "x", "@evil.example/x?a=b#c", "SUPERSECRET"))
+            .render(&fields("1", "x", "@evil.example/x?a=b#c", "SUPERSECRET"))
             .unwrap();
         let parsed = Url::parse(&url).unwrap();
         assert_eq!(parsed.host_str(), Some("tracker.example.org"));
@@ -410,7 +474,7 @@ mod test {
     #[test]
     fn an_id_cannot_escape_its_path_segment() {
         let t = UrlTemplate::parse(TPL).unwrap();
-        let url = t.render(fields("../../admin", "n", "f", "k")).unwrap();
+        let url = t.render(&fields("../../admin", "n", "f", "k")).unwrap();
         let parsed = Url::parse(&url).unwrap();
         assert_eq!(parsed.host_str(), Some("tracker.example.org"));
         assert!(parsed.path().starts_with("/rss/download/"), "{}", parsed.path());
@@ -421,7 +485,7 @@ mod test {
     fn a_dot_dot_segment_is_refused_outright() {
         let t = UrlTemplate::parse(TPL).unwrap();
         for bad in [".", ".."] {
-            let e = t.render(fields(bad, "n", "f", "k")).unwrap_err().to_string();
+            let e = t.render(&fields(bad, "n", "f", "k")).unwrap_err().to_string();
             assert!(e.contains("refusing"), "{bad}: {e}");
         }
     }
@@ -430,7 +494,22 @@ mod test {
     fn the_error_never_contains_the_key() {
         let t = UrlTemplate::parse(TPL).unwrap();
         let e = t
-            .render(fields("..", "n", "f", "SUPERSECRET"))
+            .render(&fields("..", "n", "f", "SUPERSECRET"))
+            .unwrap_err()
+            .to_string();
+        assert!(!e.contains("SUPERSECRET"), "{e}");
+
+        // The two render paths added with dynamic placeholders. Both name the
+        // placeholder, and neither may quote a value -- the missing-value one
+        // in particular runs while other fields, including the key, are in hand.
+        let e = t
+            .render(&only(&[("id", "1"), ("name", "n"), ("file", "f")]))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("{key}") && e.contains("no value"), "{e}");
+
+        let e = t
+            .render(&fields("", "n", "f", "SUPERSECRET"))
             .unwrap_err()
             .to_string();
         assert!(!e.contains("SUPERSECRET"), "{e}");

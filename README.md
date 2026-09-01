@@ -134,7 +134,140 @@ Three notes on the regexes:
   `Nordic` and the rest; the sample above collapses five entries into three that way.
 - `regex_for_announce_match` is the field you will actually have to write, since every network
   announces differently. Watch the channel by hand for a minute first, or run with
-  `RUST_LOG=debug` to see raw lines.
+  `RUST_LOG=debug` to see raw lines. `name` and `id` are required and startup fails without
+  them, naming the field — that used to be a panic on the first announcement instead.
+
+### Extra fields from the announce line
+
+**Every other named capture becomes an optional field.** Announce lines usually carry more than a
+name and an id — a category, an uploader, a freeleech marker — and naming a group is all it takes
+to capture it. Nothing about this is tracker-specific, so a network with entirely different
+metadata works the same way:
+
+```toml
+regex_for_announce_match = '''<(?P<category>[^:]+) :: (?P<subcategory>[^>]+)>\s+Name:'(?P<name>.*)' uploaded by '(?P<uploader>[^']+)'(?P<freeleech> freeleech)?.*/torrent/(?P<id>\d+)'''
+```
+
+A group wrapped in `?` is a **marker**: `(?P<freeleech> freeleech)?` captures only when the word is
+on the line, so "is this freeleech" is whether the field is present at all — distinct from a group
+that matched but captured nothing.
+
+`file` and `key` are reserved for `download_url_template`; a capture named after either is ignored
+with a warning rather than an error.
+
+When a single capture holds an unknown number of values, split it:
+
+```toml
+[captures.tags]
+split = ","
+```
+
+Values are trimmed and empty ones dropped. Only worth it when the count is unknown — two fixed
+sub-values like `category`/`subcategory` are better written as two groups. Naming a capture here
+that the regex does not declare is a startup error, because the alternative is a field that
+silently never appears.
+
+Captured fields can be used in [`download_url_template`](#configuration) — a tracker whose download
+URL needs an `authkey` from the announce line just names the group and uses `{authkey}`.
+
+### Filtering on those fields
+
+**Rules can be per watch pattern.** An entry in `regex_for_downloads_match` can be a plain string,
+as it always was, or a table carrying its own rules:
+
+```toml
+regex_for_downloads_match = [
+    "Some Release.*1080p.*",
+    { match = "Star Trek.*2160p.*", require_fields = ["freeleech"] },
+]
+```
+
+So "only take the 4K stuff if it's freeleech, anything for the rest" is expressible, which a blanket
+setting cannot say. Existing configs are unaffected — a bare string is still a valid entry, and
+`cmd:addtowatchlist` still appends one.
+
+The same rules can also be set globally, as a blanket default:
+
+```toml
+require_fields = ["freeleech"]        # never take anything without it
+
+[field_filters.category]
+matches = "^Movies$"
+
+[field_filters.uploader]
+reject_matching = "^(?i)anonymous$"
+```
+
+#### How they compose
+
+1. `regex_for_downloads_reject_match` **wins first**, always.
+2. The release must match at least one entry, or it is simply not wanted.
+3. **A field named by a matching entry is that entry's to decide** — the global rule for that field
+   is dropped, not added to. Otherwise a blanket `require_fields` would silently overrule a line
+   that deliberately says "this one, freeleech or not".
+4. Global rules still apply to fields **no matching entry mentions**.
+5. Where several matching entries name the same field, **all of their rules must pass** — overlapping
+   patterns compound rather than one quietly winning.
+
+Both `matches` and `reject_matching` test the field's *values*, so a capture with a `split` is tested
+per element — one tag out of a list is enough for either to fire.
+
+An absent field answers the two rules oppositely, and neither answer is arbitrary: `matches` rejects
+it, since there is nothing to match against; `reject_matching` passes it, since a rule about what a
+value looks like cannot fire on a value that is not there. Use `require_fields` for presence.
+
+Naming a field your regex does not declare is a **startup error**, naming the entry — a typo would
+otherwise skip every release and look exactly like a dead announce channel.
+
+`cmd:addtorrent` bypasses all of this, as it already did for the name filters: someone who names a
+torrent by hand has made the choice the filters exist to make unattended.
+
+### Tagging in qBittorrent
+
+Captured fields can become qBittorrent tags and a category:
+
+```toml
+[clients.qBittorrent]
+url               = "http://127.0.0.1:8080"
+tags_template     = "{category},{uploader}"
+category_template = "{category}"
+```
+
+qBittorrent's tags are comma-separated, and a capture with `split` expands straight back into a list
+— so `tags_template = "{tags}"` over a `split = ","` capture round-trips.
+
+A placeholder whose capture did not fire renders empty and the field is simply not sent, so a
+release with no `uploader` gets one fewer tag rather than a blank one. `category_template` overrides
+the fixed `category` only when it renders to something, so that stays the fallback.
+
+Values are stripped of CR/LF and capped at 128 characters before being sent — they come off an IRC
+announce line, and the request body is multipart, so an unfiltered value would be header injection
+into the bot's own request.
+
+Templates are parsed when the client is built, so a malformed one is a startup error rather than a
+surprise on the first add — and a placeholder naming a group your regex does not declare is rejected
+the same way the filters are.
+
+### Tagging in rTorrent
+
+rTorrent has no category of its own — `d.custom1` is the single label field, and it is what Flood and
+ruTorrent both display as tags:
+
+```toml
+[clients.rTorrent]
+xmlrpc_url    = "unix:/config/.local/share/rtorrent/rtorrent.sock"
+tags_template = "{category},{uploader}"
+```
+
+**Nothing needs configuring to see these.** Flood asks for `d.custom1` in its ordinary torrent-list
+call, and values are encoded exactly as Flood encodes them — trimmed, `encodeURIComponent`d,
+deduplicated, comma-joined — so a tag set here is indistinguishable from one you set in the UI. A
+comma *inside* a value is encoded rather than read as a separator.
+
+Two things to know: setting this **overwrites** whatever tags the torrent already has, and a failure
+to write them is logged but never fails the add — by that point the torrent is loaded and
+downloading, so reporting a failed add would be a lie. That is the same treatment the `addtime`
+stamp already gets.
 
 And two on the tracker block:
 
@@ -852,8 +985,11 @@ configs are otherwise unchanged — add one line to your `[platform.*]` block:
 download_url_template = "https://your.tracker/rss/download/{id}/{key}/{file}"
 ```
 
-`{id}`, `{name}`, `{file}` and `{key}` are the placeholders; `{key}` is your `rss_key`. Without it
-the bot refuses to start and says so, naming the field.
+`{file}` and `{key}` are always available — `{key}` is your `rss_key`, and without it the bot
+refuses to start and says so, naming the field. **Every other placeholder is one of your captures**:
+`{id}` and `{name}` are not special, they are simply the two groups every config declares. A
+placeholder naming a group your regex does not declare is a startup error listing what it does
+declare, rather than a 404 later.
 
 Two related changes in the same release, both of which only affect *newly generated* configs —
 your existing `irc.toml` is untouched:
