@@ -18,6 +18,7 @@ use tokio::time::{Duration, Instant, interval_at};
 
 mod announce;
 mod template;
+mod irc_format;
 mod irc_processor;
 mod command_processor;
 mod torrent_processor;

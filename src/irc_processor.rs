@@ -18,6 +18,7 @@ pub mod irc {
     use crate::auth::AuthResult::*;
     use crate::auth::MessageTypes::Announcement;
     use crate::auth::{redact_secrets, Authorization, MessageOrigin};
+    use crate::irc_format::strip_formatting;
     use crate::command_processor::commands::{CommandError, CommandProcessor};
     use crate::torrent_processor::torrent::TorrentProcessor;
 
@@ -756,8 +757,20 @@ pub mod irc {
                 return;
             };
 
+            // Strip mIRC formatting once, here, so everything below -- the
+            // redactor, the command parser and the announce regex -- sees the
+            // text a human sees rather than the bytes the sender's client
+            // emitted. Announce bots colour their output and the codes land
+            // exactly where a pattern expects a space; see `crate::irc_format`.
+            let stripped = strip_formatting(inner_message);
+            let inner_message: &str = &stripped;
+
             // Never log a message verbatim: in password security mode the
             // credential travels inside it as "auth:[...]".
+            //
+            // After stripping, not before: `redact_secrets` looks for a literal
+            // `auth:[`, so a colour code between the two would slip a password
+            // into the log.
             info!("{}@{}: {}", sender, target, redact_secrets(inner_message));
 
             if sender.eq_ignore_ascii_case("NickServ") {
@@ -1290,6 +1303,38 @@ pub mod test {
             "and it unavoidably matches the announce regex too -- which is why \
              msg_process has to check is_command() first"
         );
+    }
+
+    /// A coloured announce line must match a pattern written in plain text.
+    ///
+    /// This is the whole point of stripping in `msg_process`: TorrentLeech puts
+    /// `\x03` where a pattern expects a space, so the regex below -- which
+    /// describes only what a human sees -- cannot match the raw PRIVMSG. The
+    /// only symptom was "Message is not a torrent or a command", which reads as
+    /// a wrong regex rather than an unprintable byte.
+    #[test]
+    fn a_colour_coded_announce_matches_a_plain_text_regex_once_stripped() {
+        let announce = regex::Regex::new(
+            r"New Torrent Announcement:\s*<(?P<category>[^:>]+?)\s*::\s*(?P<subcategory>[^>]+?)\s*>\s*Name:'(?P<name>.*)'\s+uploaded by\s+'(?P<uploader>[^']*)'(?:\s+(?P<freeleech>freeleech))?\s*-\s*https?://[^\s/]+/torrent/(?P<id>\d+)",
+        )
+        .unwrap();
+
+        // Exactly what TorrentLeech sends, `\x03` included.
+        let raw = "\u{3}00,04New Torrent Announcement:\u{3}00,12 <Movies :: 4K>  \
+                   Name:'28 Days Later 2002 2160p UHD BluRay H265-MALUS' uploaded by \
+                   'Anonymous' freeleech - \u{3}01,15 https://www.torrentleech.org/torrent/241826790";
+
+        assert!(!announce.is_match(raw), "the raw line must not match -- that is the bug");
+
+        let stripped = crate::irc_format::strip_formatting(raw);
+        let caps = announce.captures(&stripped).expect("stripped line must match");
+
+        assert_eq!(&caps["id"], "241826790");
+        assert_eq!(&caps["category"], "Movies");
+        assert_eq!(&caps["subcategory"], "4K");
+        assert_eq!(&caps["uploader"], "Anonymous");
+        assert_eq!(&caps["name"], "28 Days Later 2002 2160p UHD BluRay H265-MALUS");
+        assert!(caps.name("freeleech").is_some());
     }
 
     #[test]

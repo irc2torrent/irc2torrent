@@ -126,8 +126,14 @@ commands_enabled = false
 IrcUserName = "YourNick"
 ```
 
-Three notes on the regexes:
+Four notes on the regexes:
 
+- **Write them against the text you can read.** mIRC colour and formatting codes are stripped
+  before any matching, so you never escape them. This matters more than it sounds: `\x03` does not
+  print, so a bot that announces `\x0300,04New Torrent Announcement:\x0300,12 <Movies :: 4K>` shows
+  up in a log as `00,04New Torrent Announcement:00,12 <Movies :: 4K>` and looks like it should
+  match — while the colon is followed by a control byte rather than the space your pattern wants.
+  The only symptom is `Message is not a torrent or a command`.
 - Matching is unanchored, so the leading and trailing `.*` in the filter lists do nothing —
   `"2160p"` and `".*2160p.*"` behave identically. Harmless, just noise.
 - Use `(?i)` for case rather than listing variants. One `(?i).*NORDIC.*` covers `NORDiC`,
@@ -920,7 +926,7 @@ Found something? See [SECURITY.md](SECURITY.md) for how to report it privately.
 ```sh
 ./docker/build.sh                    # -> flood_rtorrent_irc2torrent:dev
 TARGET=qbt-runtime ./docker/build.sh # -> flood_qbittorrent_irc2torrent:dev
-TAG=0.19.0 ./docker/build.sh
+TAG=0.19.1 ./docker/build.sh
 TARGET=debug ./docker/build.sh       # DHI -dev base, keeps sh + apk for troubleshooting
 ```
 
