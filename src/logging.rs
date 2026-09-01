@@ -9,7 +9,7 @@
 //! a misconfigured target never takes the bot down -- `sink()` returns the error
 //! for `main` to log once the terminal sink is up, and the bot carries on.
 //!
-//! Two constraints shaped the design:
+//! Three constraints shaped the design:
 //!
 //!   * **This cannot be an `options.toml` key.** The logger is initialised
 //!     before the config file is read, and `log`'s global logger can only be set
@@ -20,12 +20,21 @@
 //!     behind a `Mutex`, and logging calls sit on the IRC hot path. A UDP send
 //!     cannot block on an unreachable host; a TCP one can, which is why `tcp://`
 //!     has to be asked for by name.
+//!   * **The header is formatted here, not by the `syslog` crate.** Its
+//!     `Formatter3164` emits a day the RFC forbids; see `Rfc3164` below. That
+//!     also rules out the crate's `BasicLogger`, whose constructor takes a
+//!     `Logger<_, Formatter3164>` concretely rather than any `LogFormat` -- so
+//!     `SyslogSink` holds the `Logger` itself and does the level dispatch that
+//!     `BasicLogger` would have done.
 
+use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Mutex;
 
-use log::{LevelFilter, Log, Metadata, Record};
+use chrono::{DateTime, Utc};
+use log::{Level, LevelFilter, Log, Metadata, Record};
 use simplelog::{Config, SharedLogger};
-use syslog::{BasicLogger, Facility, Formatter3164};
+use syslog::{Facility, Logger, LoggerBackend, Severity};
 
 /// Where to send syslog. Unset or empty disables the sink entirely.
 pub const SPEC_ENV: &str = "IRC2TORRENT_SYSLOG";
@@ -92,7 +101,7 @@ pub fn sink() -> Result<Option<Box<dyn SharedLogger>>, String> {
         hostname::get().ok().map(|h| h.to_string_lossy().into_owned()).filter(|h| !h.is_empty())
     });
 
-    let formatter = Formatter3164 {
+    let formatter = Rfc3164 {
         facility,
         hostname,
         process: env_opt(TAG_ENV).unwrap_or_else(|| DEFAULT_TAG.into()),
@@ -109,7 +118,7 @@ pub fn sink() -> Result<Option<Box<dyn SharedLogger>>, String> {
 /// and cannot be set safely from one.
 fn connect(
     target: &Target,
-    formatter: Formatter3164,
+    formatter: Rfc3164,
     level: LevelFilter,
 ) -> Result<Box<dyn SharedLogger>, String> {
     let logger = match target {
@@ -129,8 +138,79 @@ fn connect(
         config: Config::default(),
         // Only TCP needs framing; see `SyslogSink::frame_with_newline`.
         frame_with_newline: matches!(target, Target::Tcp(_)),
-        inner: BasicLogger::new(logger),
+        inner: Mutex::new(logger),
     }))
+}
+
+/// The RFC 3164 header, replacing the `syslog` crate's `Formatter3164`.
+///
+/// The crate builds its timestamp from `"[month repr:short] [day] …"`, and
+/// `time`'s `[day]` defaults to **zero** padding. RFC 3164 4.1.2 forbids that:
+///
+/// > If the day of the month is less than 10, then it MUST be represented as a
+/// > space and then the number.
+///
+/// So the crate writes `Sep 01` where a parser demands `Sep  1`, and strict
+/// collectors reject the whole line. Grafana Alloy answers `expecting a Stamp
+/// timestamp [col 8]` -- col 8 being the leading zero -- and drops the record.
+/// Nothing is logged on this side, so it presents as the network having eaten
+/// the packet.
+///
+/// The failure is **date-dependent**, which is what makes it nasty: from the
+/// 10th of the month onwards both paddings produce identical bytes and
+/// everything works, then every line from the 1st to the 9th is discarded. A
+/// collector that has only ever been fed two-digit days looks perfectly healthy
+/// right up until it silently isn't.
+///
+/// Everything else matches `Formatter3164`, including UTC -- `time` cannot
+/// determine the local offset in a multi-threaded process, so the crate never
+/// emitted a local stamp either. RFC 3164 nominally wants local time and
+/// carries no zone to say which, so a collector has to be told regardless;
+/// `main.rs`'s `local_time_offset()` is what to reuse should this ever follow
+/// TZ the way the terminal sink has since 0.18.2.
+#[derive(Clone, Debug)]
+struct Rfc3164 {
+    facility: Facility,
+    hostname: Option<String>,
+    process: String,
+    pid: u32,
+}
+
+/// The TIMESTAMP field alone: `Mmm dd hh:mm:ss`, 15 bytes, day space-padded.
+///
+/// Split out, and taking its instant as an argument, so a test can pin the
+/// padding on a single-digit day whatever today happens to be. Asserting
+/// against `now()` only exercises this on nine days a month -- which is exactly
+/// how the zero-padded day shipped unnoticed.
+///
+/// `%e` is the space-padded day; `%d` is the zero-padded one that caused this.
+fn rfc3164_stamp(at: DateTime<Utc>) -> impl std::fmt::Display {
+    at.format("%b %e %H:%M:%S")
+}
+
+impl<T: std::fmt::Display> syslog::LogFormat<T> for Rfc3164 {
+    fn format<W: std::io::Write>(
+        &self,
+        w: &mut W,
+        severity: Severity,
+        message: T,
+    ) -> syslog::Result<()> {
+        // The crate's own `encode_priority` is private, but it is just this.
+        let priority = self.facility as u8 | severity as u8;
+        let stamp = rfc3164_stamp(Utc::now());
+
+        // The hostname is omitted rather than blanked when absent, matching the
+        // crate. `sink()` always supplies one; see the note there for why.
+        match self.hostname {
+            Some(ref hostname) => write!(
+                w,
+                "<{priority}>{stamp} {hostname} {}[{}]: {message}",
+                self.process, self.pid
+            ),
+            None => write!(w, "<{priority}>{stamp} {}[{}]: {message}", self.process, self.pid),
+        }
+        .map_err(syslog::Error::Write)
+    }
 }
 
 /// A human-readable description of the configured target, for the startup line.
@@ -149,13 +229,12 @@ fn env_opt(key: &str) -> Option<String> {
     std::env::var(key).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
 }
 
-/// Adapts `syslog`'s `log::Log` to the `SharedLogger` that `CombinedLogger` wants.
+/// Adapts a `syslog::Logger` to the `SharedLogger` that `CombinedLogger` wants.
 ///
 /// The level check is not redundant. `CombinedLogger::log` dispatches to every
-/// sink without consulting the sink's own `enabled()`, and `BasicLogger::enabled`
-/// tests the *global* max level -- which `CombinedLogger` sets to the maximum
-/// across all sinks. Drop that check and a terminal at `debug` would quietly put
-/// every debug record on the network.
+/// sink without consulting the sink's own `enabled()`, and it sets the global
+/// max level to the maximum across all sinks. Drop this check and a terminal at
+/// `debug` would quietly put every debug record on the network.
 struct SyslogSink {
     level: LevelFilter,
     config: Config,
@@ -169,7 +248,9 @@ struct SyslogSink {
     /// message. LF framing is the variant rsyslog, syslog-ng and QuLog default
     /// to, so add it here.
     frame_with_newline: bool,
-    inner: BasicLogger,
+    /// `Mutex` rather than the `Arc<Mutex<_>>` `BasicLogger` used: the sink is
+    /// owned by `CombinedLogger` and never shared, so the `Arc` bought nothing.
+    inner: Mutex<Logger<LoggerBackend, Rfc3164>>,
 }
 
 impl Log for SyslogSink {
@@ -181,27 +262,30 @@ impl Log for SyslogSink {
         if !self.enabled(record.metadata()) {
             return;
         }
-        if !self.frame_with_newline {
-            self.inner.log(record);
-            return;
+
+        let mut message = record.args().to_string();
+        if self.frame_with_newline {
+            message.push('\n');
         }
-        // `format_args!` cannot outlive the statement it appears in, so the
-        // rebuilt record has to be consumed inline rather than bound first.
-        let framed = format!("{}\n", record.args());
-        self.inner.log(
-            &Record::builder()
-                .args(format_args!("{framed}"))
-                .level(record.level())
-                .target(record.target())
-                .module_path(record.module_path())
-                .file(record.file())
-                .line(record.line())
-                .build(),
-        );
+
+        // A poisoned lock means another thread panicked mid-write. Losing a log
+        // line is better than panicking again from inside the logger.
+        let Ok(mut logger) = self.inner.lock() else { return };
+
+        // `log` has five levels, syslog eight. Trace joins debug, as the lowest
+        // severity syslog offers; the rest map one to one.
+        let _ = match record.level() {
+            Level::Error => logger.err(message),
+            Level::Warn => logger.warning(message),
+            Level::Info => logger.info(message),
+            Level::Debug | Level::Trace => logger.debug(message),
+        };
     }
 
     fn flush(&self) {
-        self.inner.flush();
+        if let Ok(mut logger) = self.inner.lock() {
+            let _ = logger.backend.flush();
+        }
     }
 }
 
@@ -327,13 +411,19 @@ mod test {
     use std::net::UdpSocket;
     use std::time::Duration;
 
-    fn formatter(hostname: Option<&str>) -> Formatter3164 {
-        Formatter3164 {
+    fn formatter(hostname: Option<&str>) -> Rfc3164 {
+        Rfc3164 {
             facility: Facility::LOG_DAEMON,
             hostname: hostname.map(str::to_string),
             process: DEFAULT_TAG.into(),
             pid: 4242,
         }
+    }
+
+    /// A fixed instant, so stamp assertions do not depend on today's date.
+    fn at(y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> DateTime<Utc> {
+        use chrono::TimeZone;
+        Utc.with_ymd_and_hms(y, mo, d, h, mi, s).unwrap()
     }
 
     /// Send one record to a throwaway local socket and return the datagram.
@@ -342,9 +432,9 @@ mod test {
         server.set_read_timeout(Some(Duration::from_millis(250))).unwrap();
         let addr = server.local_addr().unwrap().to_string();
 
-        // `BasicLogger::enabled` consults the *global* max level, which is Off
-        // until a logger is installed -- and none is, in a test binary. Raising
-        // it only allows more through; it cannot make another test fail.
+        // `Record::args()` is evaluated regardless, but `log::set_max_level`
+        // is Off until a logger is installed -- and none is, in a test binary.
+        // Raising it only allows more through; it cannot make another test fail.
         log::set_max_level(LevelFilter::Trace);
 
         let sink = connect(&Target::Udp(addr), formatter(hostname), level).expect("connect");
@@ -368,6 +458,37 @@ mod test {
         // field has to be present and in order.
         assert!(line.starts_with("<30>"), "{line}");
         assert!(line.contains(" nas irc2torrent[4242]: hello from the bot"), "{line}");
+
+        // The stamp is the field this test used to skip, which is how a
+        // zero-padded day shipped: every other assertion here passes either
+        // way. `<30>` then 15 bytes of `Mmm dd hh:mm:ss`, whose day begins with
+        // a space or 1-3 -- never a zero.
+        let stamp = &line[4..19];
+        assert!(matches!(&stamp[4..5], " " | "1" | "2" | "3"), "zero-padded day: {stamp:?}");
+    }
+
+    #[test]
+    fn a_single_digit_day_is_space_padded() {
+        // RFC 3164 4.1.2 requires it, and Alloy enforces it: given `Sep 01` it
+        // answers `expecting a Stamp timestamp [col 8]` and drops the line.
+        assert_eq!(rfc3164_stamp(at(2026, 9, 1, 20, 7, 13)).to_string(), "Sep  1 20:07:13");
+    }
+
+    #[test]
+    fn a_two_digit_day_is_left_alone() {
+        // Why the zero-padded day went unnoticed for three weeks: from the 10th
+        // on, both paddings produce the same bytes and nothing complains.
+        assert_eq!(rfc3164_stamp(at(2026, 8, 27, 9, 45, 37)).to_string(), "Aug 27 09:45:37");
+    }
+
+    #[test]
+    fn every_field_but_the_day_is_zero_padded() {
+        // The day is the *only* space-padded field. A positional parser needs
+        // the other four to keep their leading zeroes and the whole stamp to
+        // stay 15 bytes wide.
+        let stamp = rfc3164_stamp(at(2026, 1, 2, 3, 4, 5)).to_string();
+        assert_eq!(stamp, "Jan  2 03:04:05");
+        assert_eq!(stamp.len(), 15, "{stamp:?}");
     }
 
     #[test]

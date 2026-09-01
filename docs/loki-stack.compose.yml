@@ -218,9 +218,14 @@ configs:
         listener {
           address                = "0.0.0.0:5514"
           protocol               = "udp"
-          // rfc3164 is what irc2torrent 0.17.0 emits. Alloy's own default is
-          // rfc5424 -- this is the one line to change if the bot gains a
-          // 5424 mode.
+          // rfc3164 is what irc2torrent emits. Alloy's own default is rfc5424
+          // -- this is the one line to change if the bot gains a 5424 mode.
+          //
+          // Needs bot >= 0.18.3. Up to 0.18.2 the `syslog` crate zero-padded
+          // the day, and Alloy rejects `Sep 01` -- RFC 3164 4.1.2 wants
+          // `Sep  1` -- with `expecting a Stamp timestamp [col 8]`, dropping
+          // the line. Both paddings are identical from the 10th onwards, so it
+          // looks healthy for three weeks then eats every line until the 10th.
           syslog_format          = "rfc3164"
           // Deliberately false. RFC 3164 carries no timezone and the syslog
           // crate stamps UTC while the NAS runs UTC+3, so trusting the
