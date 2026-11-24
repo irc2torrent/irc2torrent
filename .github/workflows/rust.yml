@@ -320,6 +320,47 @@ jobs:
       # If an unfixable CVE ever blocks a release, add `only-fixed: true` here
       # rather than deleting the gate.
       # -----------------------------------------------------------------------
+
+      # -----------------------------------------------------------------------
+      # The base image's VEX statements, for the two gates below.
+      #
+      # Docker Hardened Images publish VEX with every image: "this CVE does not
+      # apply to this package, and here is why". Scout honours it when scanning
+      # the base, which is why the DHI catalogue shows the base clean. But a
+      # VEX attestation is bound to the image it describes, so an image built
+      # on top is scanned without it and every such finding comes back --
+      # 0.20.1 was blocked by a musl CVE whose patch Alpine had already
+      # backported into the very package version being flagged.
+      #
+      # So fetch the statements at release time and hand them to the scan.
+      # Nothing here is ours: no hand-written exceptions, no CVE list to
+      # maintain. The gates keep Scout's default author filter, which accepts
+      # only @docker.com authors, and each statement names an exact package
+      # version, so it cannot excuse anything we add on top or anything in a
+      # base that has since moved on.
+      #
+      # A failed fetch is not fatal: the gates then judge without VEX, which is
+      # the stricter outcome, not a looser one.
+      # -----------------------------------------------------------------------
+      - name: Fetch the base image's VEX statements
+        if: github.event_name == 'push'
+        run: |
+          mkdir -p .vex
+          base="$(sed -n 's/^ARG NODE_RUNTIME_IMAGE=//p' Dockerfile)"
+          echo "Base image: ${base}"
+          curl -fsSL https://raw.githubusercontent.com/docker/scout-cli/main/install.sh -o /tmp/install-scout.sh \
+            && sh /tmp/install-scout.sh \
+            || echo "::warning::could not install the Scout CLI"
+          if docker scout attestation get --platform linux/amd64 \
+               --predicate-type https://openvex.dev/ns/v0.2.0 --predicate \
+               "${base}" > .vex/base.vex.json \
+             && jq -e '.statements | length > 0' .vex/base.vex.json > /dev/null; then
+            echo "VEX statements from ${base}:"
+            jq -r '.statements[] | "  \(.vulnerability.name)  \(.status)  \(.justification // "")"' .vex/base.vex.json | sort -u
+          else
+            echo "::warning::no VEX statements fetched for ${base}; the gates run without them"
+            rm -f .vex/base.vex.json
+          fi
       - name: Block the release on a critical or high CVE (rTorrent image)
         if: github.event_name == 'push'
         uses: docker/scout-action@v1
@@ -328,6 +369,7 @@ jobs:
           image: ${{ env.IMAGE }}:${{ steps.vars.outputs.tag }}
           only-severities: critical,high
           exit-code: true
+          vex-location: .vex
           dockerhub-user: ${{ secrets.DOCKERHUB_USERNAME }}
           dockerhub-password: ${{ secrets.DOCKERHUB_TOKEN }}
 
@@ -339,5 +381,6 @@ jobs:
           image: ${{ env.QBT_IMAGE }}:${{ steps.vars.outputs.tag }}
           only-severities: critical,high
           exit-code: true
+          vex-location: .vex
           dockerhub-user: ${{ secrets.DOCKERHUB_USERNAME }}
           dockerhub-password: ${{ secrets.DOCKERHUB_TOKEN }}
