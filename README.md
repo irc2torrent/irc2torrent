@@ -475,7 +475,7 @@ no defined precedence.
 | `/config/.config/options.toml` | irc2torrent options: filters, download key, client, notifications. Annotated reference: [`docs/options.sample.toml`](docs/options.sample.toml). |
 | `/config/.config/irc.toml` | IRC connection settings. |
 | `/config/.local/share/rtorrent/.session` | rTorrent session. |
-| `/config/.local/share/rtorrent/log/rtorrent.log` | rTorrent's log. It is a file because rTorrent cannot reopen `/dev/stderr` after dropping privileges; its exceptions still reach `docker logs`. |
+| `/config/.local/share/rtorrent/log/rtorrent.log` | rTorrent's log. A second copy: the same lines also go to rTorrent's stdout and so to `docker logs` as `[rtorrent] …`. The supervisor rolls the file to `rtorrent.log.1` past ~16MB. |
 | `/downloads` | Torrent data. |
 
 Ports: `3000` Flood, `50000` peer traffic (tcp+udp), `50001/udp` DHT. Change the peer port in

@@ -14,8 +14,8 @@ never cloned by the build:
 
 | Path | `origin` | `upstream` (fetch only) | Version |
 |---|---|---|---|
-| `../rtorrent/libtorrent/` | `irc2torrent/libtorrent` | `rakshasa/libtorrent` | 0.16.20 |
-| `../rtorrent/rtorrent/` | `irc2torrent/rtorrent` | `rakshasa/rtorrent` | 0.16.20 |
+| `../rtorrent/libtorrent/` | `irc2torrent/libtorrent` | `rakshasa/libtorrent` | 0.16.28 |
+| `../rtorrent/rtorrent/` | `irc2torrent/rtorrent` | `rakshasa/rtorrent` | 0.16.28 |
 | `../rtorrent/flood/` | `irc2torrent/flood` | `jesec/flood` | 4.16.1 |
 
 `docker/build.sh` resolves them as `${WORKSPACE:-$(cd .. && pwd)/rtorrent}`, so the expected layout is:
@@ -112,7 +112,7 @@ and default kernel readahead pulls in far more than the piece being sent.
 Fixed upstream in libtorrent `0c1e99a5` (2025-03-28) and `dd66071e` (2025-05-31):
 `posix_fadvise(POSIX_FADV_RANDOM)` in `FileManager::open()` plus `madvise(MADV_RANDOM)` in
 `FileList::create_chunk_part()`, with a `bool hashing` parameter threaded through so hashing keeps
-sequential readahead while seeding does not. rtorrent exposes it at `src/command_local.cc:213-216`.
+sequential readahead while seeding does not. rtorrent exposes it in `src/command_system.cc` (`system.files.advise_random*`).
 
 **Both flags default to `false`** and are undocumented, so upgrading alone fixes nothing. `docker/rtorrent.rc`
 turns them on:
@@ -131,7 +131,7 @@ Flood talks to rtorrent over **SCGI** and adapts to what it finds: `clientReques
 over JSON-RPC, clearing `isJSONCapable` on error. `constants/methodCallConfigs/*` are filtered against
 `system.listMethods`, so unknown methods are dropped rather than fatal.
 
-Of the ~106 methods Flood calls, three are absent from rakshasa 0.16.20 — all jesec additions, none
+Of the ~106 methods Flood calls, three are absent from rakshasa 0.16.28 — all jesec additions, none
 blocking:
 
 | Missing | Impact |
@@ -150,7 +150,7 @@ Both RPC layers must stay enabled (they are by default): **irc2torrent needs XML
 JSON-RPC. `network.rpc.use_xmlrpc.set` / `network.rpc.use_jsonrpc.set` toggle either at runtime.
 
 irc2torrent reaches rtorrent over a **SCGI unix socket carrying XML-RPC** via vendored `dxr`. Every
-method it uses is stock on rakshasa 0.16.20 — `d.multicall2`, `load.raw_start_verbose`, `d.custom.set`,
+method it uses is stock on rakshasa 0.16.28 — `d.multicall2`, `load.raw_start_verbose`, `d.custom.set`,
 `system.listMethods`. **No user-defined method is required.** rTorrent resolves a download by hash
 case-insensitively, so lowercase hex from `lava_torrent` works as-is.
 
@@ -176,9 +176,12 @@ case-insensitively, so lowercase hex from `lava_torrent` works as-is.
 - A Windows checkout with `core.autocrlf=true` gives CRLF working trees, which autoconf cannot parse
   (`config.status: error: cannot find input file: '.in'`). The libtorrent and rtorrent build stages
   strip CR from `*.am *.ac *.m4 *.in *.sh`. Commits are unaffected — git stores LF.
-- rTorrent has no `stderr` log sink, and `/dev/stderr` fails too: it resolves to `/proc/self/fd/2`
-  and reopening it after the privilege drop is EACCES. `docker/rtorrent.rc` logs to a file. Its own
-  exception output still reaches `docker logs`.
+- rTorrent has no `stderr`/`stdout` log sink, but `log.append_file.flush = "stdout", "/dev/stdout"`
+  works because the container never changes user. `docker/rtorrent.rc` does that (plus a file copy)
+  **at the top of the file** -- an output only sees what is logged after it is opened. The supervisor's
+  existing stdout capture then relays it to `docker logs` as `[rtorrent] …`.
+- Log groups are `errors` / `events` since 0.16.2x: the old severity names (`warn`, `info`, …) are
+  gone, and `log.add_output = "warn", …` is a fatal config error, not a warning.
 - The `node` base image owns uid/gid 1000, colliding with the usual `PUID`/`PGID`. The runtime is
   shell-less and has no `chown`, so `/config` and `/downloads` are created with the right ownership
   back in the `userland` stage.

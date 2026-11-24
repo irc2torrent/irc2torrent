@@ -22,6 +22,40 @@
 #     import = /etc/rtorrent/rtorrent.rc
 #############################################################################
 
+## Logging ##################################################################
+# First in the file on purpose: an output only receives what is logged after it
+# is opened, so at the bottom -- where this used to be -- everything rTorrent
+# said while reading the rest of this config was lost.
+#
+# Two outputs, same content:
+#
+#   * /dev/stdout. The supervisor captures rTorrent's stdout and relays it as
+#     "[rtorrent] ..." to `docker logs` (and to syslog with
+#     IRC2TORRENT_SYSLOG_CHILD_LOGS=1), so this is what makes the log visible
+#     at all. rTorrent has no built-in stdout sink, but the container runs as
+#     one unprivileged user from the first instruction, so the device node can
+#     simply be opened as a file.
+#   * a file, so the log of whatever killed the previous rTorrent survives the
+#     container. append, not open: open_file truncates on every start. The
+#     supervisor rolls it to rtorrent.log.1 past ~16MB.
+#
+# .flush on both: without it entries sit in the ofstream buffer, a pipe shows
+# nothing for minutes, and an abrupt death loses exactly the last lines.
+#
+# Groups, not severities: upstream dropped critical/error/warn/notice/info
+# (naming one is now a fatal config error). "errors" is the old warn-and-above;
+# "events" adds torrent open/start/stop/hash-check. Chattier groups exist for
+# debugging -- tracker_events, tracker_requests, net_http, net_dns, dht,
+# connection, peer_events, storage, rpc_events, ...; the full list is
+# option_list_log_group in libtorrent/src/torrent/utils/option_strings.cc.
+log.append_file.flush = "stdout", "/dev/stdout"
+log.append_file.flush = "rtorrent", "/config/.local/share/rtorrent/log/rtorrent.log"
+log.add_output = "errors", "stdout"
+log.add_output = "events", "stdout"
+log.add_output = "errors", "rtorrent"
+log.add_output = "events", "rtorrent"
+
+
 ## Paths ####################################################################
 directory.default.set = /downloads
 session.path.set      = /config/.local/share/rtorrent/.session
@@ -45,9 +79,11 @@ pieces.preload.min_rate.set    = 5120
 
 ## Memory / file descriptors ################################################
 #pieces.memory.max.set = 2G
-network.max_open_files.set             = 512
-system.sockets.max_size.set            = 512
-network.http.max_total_connections.set = 48
+# network.max_open_files.set and network.http.max_total_connections.set used to
+# be set here. Upstream turned both into stubs that log a deprecation and change
+# nothing, so they are gone; the per-category replacements are
+# system.sockets.files.min_alloc.set / system.sockets.http.min_alloc.set.
+system.sockets.max_size.set = 512
 
 
 ## RPC ######################################################################
@@ -89,7 +125,10 @@ protocol.pex.set = yes
 dht.add_node = dht.transmissionbt.com:6881
 dht.add_node = dht.libtorrent.org:25401
 
-protocol.encryption.set = allow_incoming,enable_retry,prefer_plaintext
+# Was allow_incoming,enable_retry,prefer_plaintext. Upstream replaced that
+# vocabulary with a handshake/stream pair and maps those three words onto
+# exactly this, with an "obsolete options" error line on every start.
+protocol.encryption.set = handshake_allow,stream_allow
 
 
 ## Throttling ###############################################################
@@ -113,23 +152,6 @@ system.umask.set = 0027
 
 schedule = monitor_diskspace, 15, 60, ((close_low_diskspace, 1000M))
 schedule = session_save, 1200, 1200, ((session.save))
-
-
-## Logging ##################################################################
-# rTorrent has no built-in "stderr" sink, and /dev/stderr cannot be reopened
-# after privileges drop, so log to a file:
-#   docker exec <container> tail -f /config/.local/share/rtorrent/log/rtorrent.log
-# append_file, not open_file: open_file truncates, so every restart destroyed
-# the log of whatever caused the previous exit -- the one thing worth reading.
-# The .flush variant matters just as much: without it entries sit in the
-# ofstream buffer, and an abrupt death loses exactly the last lines before it.
-# Flushing per line is affordable at "warn".
-#
-# The supervisor rolls this to rtorrent.log.1 when it grows past ~16MB, since
-# rTorrent has no rotation of its own and an appended log otherwise grows
-# without bound.
-log.append_file.flush = "rtorrent", "/config/.local/share/rtorrent/log/rtorrent.log"
-log.add_output = "warn", "rtorrent"
 
 
 ## Daemon ###################################################################
