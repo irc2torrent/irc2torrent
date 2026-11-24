@@ -370,6 +370,9 @@ jobs:
           only-severities: critical,high
           exit-code: true
           vex-location: .vex
+          # Without this the statements are only printed next to the finding;
+          # it is still counted, and still fails the gate.
+          only-vex-affected: true
           dockerhub-user: ${{ secrets.DOCKERHUB_USERNAME }}
           dockerhub-password: ${{ secrets.DOCKERHUB_TOKEN }}
 
@@ -382,5 +385,8 @@ jobs:
           only-severities: critical,high
           exit-code: true
           vex-location: .vex
+          # Without this the statements are only printed next to the finding;
+          # it is still counted, and still fails the gate.
+          only-vex-affected: true
           dockerhub-user: ${{ secrets.DOCKERHUB_USERNAME }}
           dockerhub-password: ${{ secrets.DOCKERHUB_TOKEN }}
