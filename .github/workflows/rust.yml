@@ -334,8 +334,8 @@ jobs:
       #
       # So fetch the statements at release time and hand them to the scan.
       # Nothing here is ours: no hand-written exceptions, no CVE list to
-      # maintain. The gates keep Scout's default author filter, which accepts
-      # only @docker.com authors, and each statement names an exact package
+      # maintain. The gates accept only @docker.com authors (see vex-author
+      # below), and each statement names an exact package
       # version, so it cannot excuse anything we add on top or anything in a
       # base that has since moved on.
       #
@@ -370,13 +370,14 @@ jobs:
           only-severities: critical,high
           exit-code: true
           vex-location: .vex
-          # Without these the statements are only printed next to the finding;
-          # it is still counted, and still fails the gate. Since Scout 1.25 a
-          # finding covered this way is "suppressed", and ignore-suppressed is
-          # what drops it -- only-vex-affected alone did not (0.20.3). That
-          # also honours exceptions set in the Scout dashboard for this org.
+          # The author filter is not optional. The Scout CLI defaults it to
+          # Docker's own addresses, but this action defaults it to empty, and
+          # with no accepted author a statement is printed under the finding
+          # while the finding is still counted -- which is how 0.20.2 to
+          # 0.20.4 each loaded the statement and failed anyway. Verified by
+          # running the action's own binary against the published images.
+          vex-author: '<.*@docker.com>'
           only-vex-affected: true
-          ignore-suppressed: true
           dockerhub-user: ${{ secrets.DOCKERHUB_USERNAME }}
           dockerhub-password: ${{ secrets.DOCKERHUB_TOKEN }}
 
@@ -389,12 +390,13 @@ jobs:
           only-severities: critical,high
           exit-code: true
           vex-location: .vex
-          # Without these the statements are only printed next to the finding;
-          # it is still counted, and still fails the gate. Since Scout 1.25 a
-          # finding covered this way is "suppressed", and ignore-suppressed is
-          # what drops it -- only-vex-affected alone did not (0.20.3). That
-          # also honours exceptions set in the Scout dashboard for this org.
+          # The author filter is not optional. The Scout CLI defaults it to
+          # Docker's own addresses, but this action defaults it to empty, and
+          # with no accepted author a statement is printed under the finding
+          # while the finding is still counted -- which is how 0.20.2 to
+          # 0.20.4 each loaded the statement and failed anyway. Verified by
+          # running the action's own binary against the published images.
+          vex-author: '<.*@docker.com>'
           only-vex-affected: true
-          ignore-suppressed: true
           dockerhub-user: ${{ secrets.DOCKERHUB_USERNAME }}
           dockerhub-password: ${{ secrets.DOCKERHUB_TOKEN }}
