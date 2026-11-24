@@ -370,9 +370,13 @@ jobs:
           only-severities: critical,high
           exit-code: true
           vex-location: .vex
-          # Without this the statements are only printed next to the finding;
-          # it is still counted, and still fails the gate.
+          # Without these the statements are only printed next to the finding;
+          # it is still counted, and still fails the gate. Since Scout 1.25 a
+          # finding covered this way is "suppressed", and ignore-suppressed is
+          # what drops it -- only-vex-affected alone did not (0.20.3). That
+          # also honours exceptions set in the Scout dashboard for this org.
           only-vex-affected: true
+          ignore-suppressed: true
           dockerhub-user: ${{ secrets.DOCKERHUB_USERNAME }}
           dockerhub-password: ${{ secrets.DOCKERHUB_TOKEN }}
 
@@ -385,8 +389,12 @@ jobs:
           only-severities: critical,high
           exit-code: true
           vex-location: .vex
-          # Without this the statements are only printed next to the finding;
-          # it is still counted, and still fails the gate.
+          # Without these the statements are only printed next to the finding;
+          # it is still counted, and still fails the gate. Since Scout 1.25 a
+          # finding covered this way is "suppressed", and ignore-suppressed is
+          # what drops it -- only-vex-affected alone did not (0.20.3). That
+          # also honours exceptions set in the Scout dashboard for this org.
           only-vex-affected: true
+          ignore-suppressed: true
           dockerhub-user: ${{ secrets.DOCKERHUB_USERNAME }}
           dockerhub-password: ${{ secrets.DOCKERHUB_TOKEN }}
