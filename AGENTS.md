@@ -1,38 +1,41 @@
-# CLAUDE.md
+# AGENTS.md
 
-Guidance for Claude Code (claude.ai/code) working in this repository.
+Guidance for coding agents working in this repository.
 
 ## What this is
 
 `irc2torrent` is a Rust IRC announce bot: it watches an announce channel, matches release lines
-against user regexes, and adds the matches to rTorrent or qBittorrent. It is also the **build hub**
-for a container image bundling the whole stack, so this repo is where the Dockerfile, the runtime
-supervisor and the rTorrent config live.
+against user regexes and field rules, and adds the matches to rTorrent or qBittorrent (or Flood).
+It is also the **build hub** for a container image bundling the whole stack, so this repo is where
+the Dockerfile, the runtime supervisor, and the rTorrent config live.
 
 Building the image needs three sibling checkouts, consumed as BuildKit **named contexts** — they are
 never cloned by the build:
 
-| Path | `origin` | `upstream` (fetch only) | Version |
-|---|---|---|---|
-| `../rtorrent/libtorrent/` | `irc2torrent/libtorrent` | `rakshasa/libtorrent` | 0.16.28 |
-| `../rtorrent/rtorrent/` | `irc2torrent/rtorrent` | `rakshasa/rtorrent` | 0.16.28 |
-| `../rtorrent/flood/` | `irc2torrent/flood` | `jesec/flood` | 4.16.1 |
+| Path | `origin` | `upstream` (fetch only) | Branch | Version |
+|---|---|---|---|---|
+| `../rtorrent/libtorrent/` | `irc2torrent/libtorrent` | `rakshasa/libtorrent` | `fix/aclocal-amflags-libtool-2.5.4` | 0.16.29 |
+| `../rtorrent/rtorrent/` | `irc2torrent/rtorrent` | `rakshasa/rtorrent` | `fix/aclocal-amflags-libtool-2.5.4` | 0.16.29 |
+| `../rtorrent/flood/` | `irc2torrent/flood` | `jesec/flood` | `master` | 4.16.4 |
 
 `docker/build.sh` resolves them as `${WORKSPACE:-$(cd .. && pwd)/rtorrent}`, so the expected layout is:
 
 ```
 <workspace>/
-├── irc2torrent/          <- this repo
+├── irc2torrent/          <- this repo (branch: main)
 └── rtorrent/
     ├── libtorrent/  rtorrent/  flood/
 ```
 
-Push URLs on `upstream` are set to a bogus string so a mistyped `git push` fails loudly instead of
-reaching someone else's repo. `master` tracks `origin/master`, so a bare `git push` goes to the fork.
+Push URLs on `upstream` are set to `DISABLED_push_to_origin_instead` so a mistyped `git push upstream`
+fails loudly instead of reaching someone else's repo. Each checkout tracks its corresponding
+`origin/<branch>` (`main` for `irc2torrent`, `fix/aclocal-amflags-libtool-2.5.4` for `libtorrent` and
+`rtorrent`, `master` for `flood`), so a bare `git push` goes to the fork.
 
 `dxr/` is **vendored, not a submodule** — a fork of [`ironthree/dxr`](https://github.com/ironthree/dxr)
-carrying unix-socket support and a rustls migration. It is consumed as a Cargo path dependency. See
-the Vendored code section of `README.md`; keep its `LICENSE-MIT`/`LICENSE-APACHE` intact.
+carrying unix-socket support (`#[cfg(unix)]`, Linux & macOS) and a rustls migration. It is consumed
+as a Cargo path dependency. See the Vendored code section of `README.md`; keep its
+`LICENSE-MIT`/`LICENSE-APACHE` intact.
 
 **History**: rtorrent/libtorrent track rakshasa, not the `jesec` fork. That fork has been dormant
 since **July 2023** and is missing upstream's entire 2024–2026 thread-safety, socket and DNS rework —
@@ -40,28 +43,32 @@ including the issue #443 fix.
 
 ## Build & test
 
-**Everything builds in Docker.** `rtorrent` is the client (ncurses UI + RPC + config language);
+**Full images build in Docker.** `rtorrent` is the client (ncurses UI + RPC + config language);
 `libtorrent` is the engine. They must be built and versioned **in lockstep** — rtorrent calls
 unstable internal libtorrent APIs, and upstream bumps both to the same version on every release.
 
 ```sh
 ./docker/build.sh                     # -> flood_rtorrent_irc2torrent:dev
 TARGET=qbt-runtime ./docker/build.sh  # -> flood_qbittorrent_irc2torrent:dev  (no rtorrent contexts)
-TARGET=debug ./docker/build.sh        # keeps sh + apk for troubleshooting
+TARGET=debug ./docker/build.sh        # rTorrent -dev base, keeps sh + apk for troubleshooting
+TARGET=qbt-debug ./docker/build.sh    # qBittorrent -dev base, keeps sh + apk for troubleshooting
 ```
 
 Both images come from **one Dockerfile**, selected by `--target`; BuildKit prunes stages outside the
-target's graph, which is why `qbt-runtime` needs neither the libtorrent nor the rtorrent tree while
-still sharing the `flood-build` and `irc2torrent-build` cache.
+target's graph, which is why `qbt-runtime` and `qbt-debug` need neither the libtorrent nor the
+rtorrent tree while still sharing the `flood-build` and `irc2torrent-build` cache.
 
-For Rust alone, without a full image build:
+For Rust alone, without a full image build, `cargo test --locked` runs natively on Linux and macOS,
+or inside Docker:
 
 ```sh
+cargo test --locked                   # native Linux/macOS (CI also runs `cargo audit`)
 docker run --rm --user root -v "$PWD:/src" -w /src <rust-image> cargo test --locked
 ```
 
-Mount the **whole working copy**, not just `src/`: `the_sample_config_is_valid` reads
-`docs/options.sample.toml`, and `get_irc_default_config` does `include_str!("../irc.defaults.toml")`.
+When running in Docker, mount the **whole working copy**, not just `src/`:
+`the_sample_config_is_valid` reads `docs/options.sample.toml`, and `get_irc_default_config` does
+`include_str!("../irc.defaults.toml")`.
 
 **Never run `npm`/`pnpm`/`node` on the host.** Flood is built and tested only inside Docker — a
 standing supply-chain constraint, not a convenience.
@@ -73,16 +80,30 @@ README "Base images".
 ## Architecture
 
 **This repo** — `src/`:
-- `lib.rs` wires everything: config → client → platform → IRC/command/torrent processors.
-- `config.rs` is one big module: `OptionData` (options.toml), `LoadedOptions` (parsed + compiled
-  regexes, and the **only** place validation lives), the file watcher, and live reload.
-- `platforms/` is the tracker layer: a `TorrentPlatform` trait, one `HttpTracker` implementation, and
-  `url_template.rs`. **There is no tracker-specific code** — a network is an announce regex plus a
-  `download_url_template`, both from config.
-- `clients/` — rTorrent (XML-RPC over SCGI via dxr), qBittorrent (HTTP), Flood (add-only).
-- `supervisor.rs` — the bot runs as **PID 1** in the container (`IRC2TORRENT_SUPERVISE=1`) and
-  starts/reaps rTorrent or qBittorrent and Flood itself. There is no s6-overlay.
-- `auth.rs`, `notify.rs`, `transports/` — command authorization, notification fan-out, Telegram/Slack.
+- `main.rs` — logging init, `rustls` ring crypto provider setup, and supervisor vs standalone dispatch.
+- `lib.rs` — wires everything: config → client → platform → IRC/command/torrent processors.
+- `config.rs` — `OptionData` (`options.toml`), `LoadedOptions` (parsed + compiled regexes, and the
+  **only** place validation lives), `FLOOD_OPTION_ALLOWEDPATH`-derived defaults, the file watcher,
+  and live reload.
+- `announce.rs`, `template.rs`, `irc_format.rs` — mIRC formatting/colour stripping, structured
+  named-group announce capture (including `[captures.<name>].split`), and shared `{placeholder}`
+  template rendering for URLs and tags/categories.
+- `irc_processor.rs`, `command_processor.rs`, `torrent_processor.rs` — IRC connection & reconnect
+  backoff, WHOIS identification checks, ISON presence, paced outbound queue with cancellation epochs,
+  cross-transport `cmd:` / `!` command handling, and release filtering (name match/reject +
+  global/per-entry field rules), download, and client submission.
+- `platforms/` — tracker layer: a `TorrentPlatform` trait, `HttpTracker` (`http.rs`, bounded torrent
+  downloads and HTTP timeouts), and `url_template.rs`. **There is no tracker-specific code** — a
+  network is an announce regex plus a `download_url_template`, both from config.
+- `clients/` — rTorrent (XML-RPC over SCGI via vendored `dxr`), qBittorrent (HTTP), Flood (HTTP,
+  add-only with automatic 401 re-login).
+- `supervisor.rs` — the bot runs as **PID 1** in the container (`IRC2TORRENT_SUPERVISE=1`),
+  starts/reaps rTorrent or qBittorrent and Flood itself (no s6-overlay), cleans stale
+  `rtorrent.lock`/`rtorrent.sock` on restart, and waits for client readiness before launching Flood
+  and the bot.
+- `auth.rs`, `notify.rs`, `transports/`, `logging.rs` — command authorization, notification fan-out
+  (IRC/ntfy/Telegram/Slack), Telegram/Slack transports, and optional RFC 3164 remote syslog
+  (`IRC2TORRENT_SYSLOG`).
 
 **libtorrent** — the engine, no UI, no config parsing:
 - `src/torrent/` is the public API. `torrent.cc` owns process init and four threads (main, disk, net,
@@ -131,7 +152,7 @@ Flood talks to rtorrent over **SCGI** and adapts to what it finds: `clientReques
 over JSON-RPC, clearing `isJSONCapable` on error. `constants/methodCallConfigs/*` are filtered against
 `system.listMethods`, so unknown methods are dropped rather than fatal.
 
-Of the ~106 methods Flood calls, three are absent from rakshasa 0.16.28 — all jesec additions, none
+Of the ~106 methods Flood calls, three are absent from rakshasa 0.16.29 — all jesec additions, none
 blocking:
 
 | Missing | Impact |
@@ -150,8 +171,9 @@ Both RPC layers must stay enabled (they are by default): **irc2torrent needs XML
 JSON-RPC. `network.rpc.use_xmlrpc.set` / `network.rpc.use_jsonrpc.set` toggle either at runtime.
 
 irc2torrent reaches rtorrent over a **SCGI unix socket carrying XML-RPC** via vendored `dxr`. Every
-method it uses is stock on rakshasa 0.16.28 — `d.multicall2`, `load.raw_start_verbose`, `d.custom.set`,
-`system.listMethods`. **No user-defined method is required.** rTorrent resolves a download by hash
+method it uses is stock on rakshasa 0.16.29 — `d.multicall2`, `load.raw_start_verbose`,
+`d.custom.set` (for `addtime`), and `d.custom1.set` (for `tags_template`, since Flood reads tags
+from `d.custom1`). **No user-defined method is required.** rTorrent resolves a download by hash
 case-insensitively, so lowercase hex from `lava_torrent` works as-is.
 
 ## Working conventions
@@ -168,7 +190,7 @@ case-insensitively, so lowercase hex from `lava_torrent` works as-is.
   (`encoding.add`, `dht.add_bootstrap`) no longer exist. Macro-made `.set` names will not show up in a
   literal grep — check the `CMD2_VAR_*` macro instead.
 
-### Known build gotchas (all already handled)
+### Known build & runtime gotchas (all already handled)
 
 - `ACLOCAL_AMFLAGS = -I scripts` in `Makefile.am` duplicates `AC_CONFIG_MACRO_DIRS` and makes
   `libtoolize` fail hard on libtool ≥ 2.5.4 (Alpine 3.22+). Both forks carry the fix on branch
@@ -182,9 +204,14 @@ case-insensitively, so lowercase hex from `lava_torrent` works as-is.
   existing stdout capture then relays it to `docker logs` as `[rtorrent] …`.
 - Log groups are `errors` / `events` since 0.16.2x: the old severity names (`warn`, `info`, …) are
   gone, and `log.add_output = "warn", …` is a fatal config error, not a warning.
+- Upstream rTorrent's `SCgi::open` does not unlink an existing Unix socket before `::bind`. If
+  rTorrent dies uncleanly, `supervisor.rs` removes both stale `rtorrent.lock` and stale
+  `rtorrent.sock` before restarting it.
 - The `node` base image owns uid/gid 1000, colliding with the usual `PUID`/`PGID`. The runtime is
-  shell-less and has no `chown`, so `/config` and `/downloads` are created with the right ownership
-  back in the `userland` stage.
+  shell-less and has no `chown`, so `/config` and `/downloads` (rTorrent `userland` → `runtime`) and
+  `/config` and `/data` (`qbt-userland` → `qbt-runtime`) are created with the right ownership back
+  in their userland stages, matching `FLOOD_OPTION_ALLOWEDPATH` and `VOLUME` (which `config.rs` also
+  uses to derive default `torrent_dir`/`disk_path`).
 - Flood shells out to GNU `df --exclude-type=`, so the runtime stages GNU coreutils and symlinks
   `/bin/df` to it — busybox `df` does not accept that flag.
 - Qt loads its TLS backend with `dlopen`, so it appears in no `ldd` listing. Miss it and qBittorrent
