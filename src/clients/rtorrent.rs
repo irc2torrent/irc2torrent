@@ -176,14 +176,8 @@ impl rTorrent {
     ) -> Result<(), Error> {
         let name = announce.name.clone();
         if let Ok(bytes) = &general_purpose::STANDARD.decode(file.as_bytes()) {
-            let request = Call::new("load.raw_start_verbose", ("", bytes.as_slice()));
-            // let request = dxr::client::Call::new("load.raw_start_verbose", file);
-            let result: Result<RpcInt, ClientError> = self.client.call(request).await;
-
-            // The bytes came from the tracker, so they may not be a well-formed
-            // torrent at all -- an error page or a truncated download is enough.
-            // This used to be `.unwrap()`, which panicked the whole process
-            // *after* the torrent had already been handed to rTorrent.
+            // Parse before uploading so an HTML error page or truncated download
+            // is never handed to rTorrent and never fails *after* loading.
             let the_hash = match Torrent::read_from_bytes(bytes) {
                 Ok(t) => t.info_hash(),
                 Err(e) => {
@@ -193,6 +187,10 @@ impl rTorrent {
                     )));
                 }
             };
+
+            let request = Call::new("load.raw_start_verbose", ("", bytes.as_slice()));
+            // let request = dxr::client::Call::new("load.raw_start_verbose", file);
+            let result: Result<RpcInt, ClientError> = self.client.call(request).await;
 
             match result {
                 Ok(r) => {
@@ -235,17 +233,19 @@ impl rTorrent {
                         }
                     }
 
-                    // Tags, into the same custom-field mechanism. rTorrent has
-                    // no category of its own: `d.custom1` is the single label
-                    // field, and Flood asks for it in its ordinary torrent-list
-                    // call, so this shows up with nothing else configured.
+                    // Tags, into rTorrent's built-in `d.custom1` field (NOT
+                    // `d.custom.set(hash, "custom1", ...)`, which writes to the
+                    // separate `rtorrent.custom["custom1"]` map that Flood and
+                    // ruTorrent never read). Flood reads `d.custom1=` in its
+                    // ordinary torrent-list call, so tags set via `d.custom1.set`
+                    // show up with nothing else configured.
                     if let Some(template) = &self.tags_template {
-                        let rendered = template.render(announce);
-                        let encoded = encode_tags(rendered.split(','));
+                        let items = template.render_comma_items(announce);
+                        let encoded = encode_tags(items.iter().map(String::as_str));
                         if !encoded.is_empty() {
                             let tag = Call::new(
-                                "d.custom.set",
-                                (the_hash.clone(), "custom1", encoded.clone()),
+                                "d.custom1.set",
+                                (the_hash.clone(), encoded.clone()),
                             );
                             match self.client.call::<_, RpcInt>(tag).await {
                                 Ok(_) => info!("Tags set for {name} ({the_hash}): {encoded}"),

@@ -30,7 +30,7 @@ url = { version = "2.5", optional = true }
 # SCGI request framing, which is a dozen lines and is now inline in
 # reqwest_support.rs. tokio-scgi was last released in 2021 and pinned
 # tokio-util to 0.6, holding that whole branch of the tree back.
-tokio = { version = "1.0", features = ["io-util", "macros", "net", "rt-multi-thread"] }
+tokio = { version = "1.0", features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }
 futures = "0.3.29"
 
 [features]

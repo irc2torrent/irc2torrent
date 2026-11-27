@@ -175,6 +175,80 @@ impl TextTemplate {
         }
         out
     }
+
+    /// Render a comma-separated tag template into individual items.
+    ///
+    /// Splits only on literal `,` characters in the template and expands
+    /// multi-valued (split) captures into separate items, while preserving any
+    /// `,` that appeared inside a captured value so the caller can encode it
+    /// rather than letting it split into two tags.
+    pub fn render_comma_items(&self, fields: &impl FieldSource) -> Vec<String> {
+        let mut segments: Vec<Vec<PartRef<'_>>> = vec![Vec::new()];
+        for part in &self.parts {
+            match part {
+                Part::Literal(s) => {
+                    let mut pieces = s.split(',');
+                    if let Some(first) = pieces.next() {
+                        if !first.is_empty() {
+                            segments.last_mut().unwrap().push(PartRef::Literal(first));
+                        }
+                    }
+                    for piece in pieces {
+                        segments.push(Vec::new());
+                        if !piece.is_empty() {
+                            segments.last_mut().unwrap().push(PartRef::Literal(piece));
+                        }
+                    }
+                }
+                Part::Field(i) => {
+                    segments.last_mut().unwrap().push(PartRef::Field(*i));
+                }
+            }
+        }
+
+        let mut items = Vec::new();
+        for seg in segments {
+            let mut acc = vec![String::new()];
+            for part in seg {
+                match part {
+                    PartRef::Literal(lit) => {
+                        for s in &mut acc {
+                            s.push_str(lit);
+                        }
+                    }
+                    PartRef::Field(i) => {
+                        let values = fields.values(&self.names[i]);
+                        if values.is_empty() {
+                            // Absent capture contributes empty text, matching `render`.
+                            continue;
+                        }
+                        if values.len() == 1 {
+                            for s in &mut acc {
+                                s.push_str(values[0]);
+                            }
+                        } else {
+                            let mut expanded = Vec::with_capacity(acc.len() * values.len());
+                            for prefix in &acc {
+                                for v in &values {
+                                    let mut next = prefix.clone();
+                                    next.push_str(v);
+                                    expanded.push(next);
+                                }
+                            }
+                            acc = expanded;
+                        }
+                    }
+                }
+            }
+            items.extend(acc);
+        }
+        items
+    }
+}
+
+enum PartRef<'a> {
+    Literal(&'a str),
+    Field(usize),
 }
 
 #[cfg(test)]
@@ -250,5 +324,25 @@ mod test {
         let t = TextTemplate::parse("{a}-{a}", "tags_template").unwrap();
         assert_eq!(t.placeholder_names(), ["a"]);
         assert_eq!(t.render(&fields(&[("a", &["x"])])), "x-x");
+    }
+
+    #[test]
+    fn comma_items_preserve_commas_inside_captured_values() {
+        let t = TextTemplate::parse("{category},{uploader}", "tags_template").unwrap();
+        let items = t.render_comma_items(&fields(&[
+            ("category", &["Movies"]),
+            ("uploader", &["a,b"]),
+        ]));
+        assert_eq!(items, vec!["Movies", "a,b"]);
+    }
+
+    #[test]
+    fn comma_items_expand_multi_valued_captures() {
+        let t = TextTemplate::parse("{category},{tags}", "tags_template").unwrap();
+        let items = t.render_comma_items(&fields(&[
+            ("category", &["Movies"]),
+            ("tags", &["hd", "remux"]),
+        ]));
+        assert_eq!(items, vec!["Movies", "hd", "remux"]);
     }
 }

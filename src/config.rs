@@ -450,6 +450,41 @@ pub mod config {
                 }
             }
         }
+
+        /// Whether any configured backend wants completion or low-disk events,
+        /// accounting for per-backend `[..events]` overrides even when the
+        /// global switch is false.
+        pub fn poll_wants(&self) -> Option<(bool, bool)> {
+            let guard = self.0.lock().ok()?;
+            let n = &guard.data.notifications;
+
+            let mut filters: Vec<&EventFilter> = Vec::new();
+            if let Some(e) = &n.email {
+                filters.push(&e.events);
+            }
+            if let Some(nt) = &n.ntfy {
+                filters.push(&nt.events);
+            }
+            if let Some(irc) = &n.irc {
+                filters.push(&irc.events);
+            }
+            if let Some(t) = &guard.data.telegram {
+                if t.notifications {
+                    filters.push(&t.events);
+                }
+            }
+            if let Some(s) = &guard.data.slack {
+                if s.notifications {
+                    filters.push(&s.events);
+                }
+            }
+
+            let want_finished = n.on_download_finished
+                || filters.iter().any(|f| f.on_download_finished == Some(true));
+            let want_disk_low =
+                n.on_disk_low || filters.iter().any(|f| f.on_disk_low == Some(true));
+            Some((want_finished, want_disk_low))
+        }
     }
 
     impl FloodLimit {
@@ -715,6 +750,29 @@ pub mod config {
     /// ships no rTorrent at all spent its first run failing to reach one.
     ///
     /// The image says which it is; unset means rTorrent, as before.
+    /// The data directory a freshly written `options.toml` should point at.
+    ///
+    /// Mirrors the supervisor's `FLOOD_OPTION_ALLOWEDPATH` resolution so that
+    /// `qbt-runtime` (whose writable volume is `/data`) generates a working
+    /// `torrent_dir` and `disk_path` instead of pointing at a nonexistent
+    /// `/downloads` on a read-only root filesystem.
+    fn default_data_dir() -> String {
+        let raw = std::env::var("FLOOD_OPTION_ALLOWEDPATH")
+            .or_else(|_| std::env::var("FLOOD_OPTION_allowedpath"))
+            .unwrap_or_default();
+        let trimmed = raw.trim();
+        let stripped = trimmed.trim_end_matches('/');
+        if stripped.is_empty() {
+            if trimmed.is_empty() {
+                "/downloads".to_string()
+            } else {
+                "/".to_string()
+            }
+        } else {
+            stripped.to_string()
+        }
+    }
+
     fn default_client() -> TorrentClientOption {
         match std::env::var("IRC2TORRENT_DEFAULT_CLIENT").unwrap_or_default().as_str() {
             "qBittorrent" | "qbittorrent" => {
@@ -891,7 +949,7 @@ pub mod config {
                 digest_seconds: 300,
                 max_per_hour: 20,
                 poll_seconds: 120,
-                disk_path: "/downloads".to_string(),
+                disk_path: default_data_dir(),
                 disk_warn_percent: 10.0,
                 email: None,
                 ntfy: None,
@@ -947,7 +1005,7 @@ pub mod config {
     }
 
     /// ntfy: a topic name is the entire setup -- no account, no API key.
-    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    #[derive(Clone, PartialEq, Serialize, Deserialize)]
     pub struct NtfyOptions {
         /// Topic on ntfy.sh, or a full URL for a self-hosted instance.
         ///
@@ -960,6 +1018,18 @@ pub mod config {
         /// Last, for the same TOML reason as EmailOptions::events.
         #[serde(default)]
         pub events: EventFilter,
+    }
+
+    // Hand-written so neither the bearer token nor the secret topic can reach a
+    // log via a stray `{:?}`.
+    impl std::fmt::Debug for NtfyOptions {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("NtfyOptions")
+                .field("topic", &"<redacted>")
+                .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+                .field("events", &self.events)
+                .finish()
+        }
     }
 
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1243,7 +1313,7 @@ pub mod config {
                 // startup error naming the field.
                 download_url_template: String::new(),
                 rss_key: String::new(),
-                torrent_dir: "/downloads/.torrents".to_string(),
+                torrent_dir: format!("{}/.torrents", default_data_dir()),
             }
         }
     }
@@ -1860,9 +1930,12 @@ pub mod config {
                         return;
                     }
                 };
-                apply(&mut guard.data);
+                // Mutate a clone so a failed validation never leaves `guard.data`
+                // modified and out of sync with the compiled regexes.
+                let mut candidate = guard.data.clone();
+                apply(&mut candidate);
 
-                match LoadedOptions::from_data(guard.data.clone()) {
+                match LoadedOptions::from_data(candidate) {
                     Ok(loaded) => {
                         let snapshot = loaded.data.clone();
                         *guard = loaded;
@@ -2972,6 +3045,16 @@ commands = false
             assert!(!shown.contains("secret"), "{shown}");
             // The non-secret fields stay visible, or the output is useless.
             assert!(shown.contains("C1") && shown.contains("U1"), "{shown}");
+
+            let ntfy = NtfyOptions {
+                topic: "unguessable-secret-topic".into(),
+                token: Some("tk_secret_bearer".into()),
+                events: EventFilter::default(),
+            };
+            let ntfy_shown = format!("{ntfy:?}");
+            assert!(!ntfy_shown.contains("unguessable-secret-topic"), "{ntfy_shown}");
+            assert!(!ntfy_shown.contains("tk_secret_bearer"), "{ntfy_shown}");
+            assert!(ntfy_shown.contains("<redacted>"), "{ntfy_shown}");
         }
 
         /// A backend table with per-event overrides has to parse, since that is

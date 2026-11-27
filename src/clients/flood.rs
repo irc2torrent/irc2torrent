@@ -1,18 +1,18 @@
 use std::collections::HashMap;
-use std::fmt;
-use std::future::Future;
-use std::io::ErrorKind;
-use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Error;
 use log::{error, info};
-use reqwest::Url;
+use reqwest::StatusCode;
 use reqwest_cookie_store::CookieStoreMutex;
 use serde_derive::{Deserialize, Serialize};
 
 use crate::announce::Announce;
 use crate::clients::{DownloadResult};
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub struct Flood {
     client: reqwest::Client,
@@ -28,8 +28,10 @@ impl Flood {
     pub async fn new(username: String, password: String, url: String, dest: String) -> Result<Flood, Error> {
         let cookie_store = reqwest_cookie_store::CookieStoreMutex::new(Default::default());
         let cookie_store = Arc::new(cookie_store);
-        let mut client = reqwest::Client::builder()
+        let client = reqwest::Client::builder()
             .cookie_provider(std::sync::Arc::clone(&cookie_store))
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT)
             .build()?;
         let mut this = Self { client, cookie_store: Arc::clone(&cookie_store), username: username.clone(), password: password.clone(), url: url.clone(), dest, retry_limit: 3 };
         this.login().await?;
@@ -65,27 +67,28 @@ impl Flood {
 
 impl Flood {
     pub(crate) async fn get_dl_list(&self) -> Result<Vec<DownloadResult>, Error> {
-        let mut response_text = String::new();
-        let mut retry_count:u8 = 0;
-        loop {
+        let mut retry_count: u8 = 0;
+        let response_text = loop {
             let resp = self.client.get(&format!("{}/api/torrents", &self.url))
                 .header("Content-Type", "application/json")
                 .send()
                 .await?;
-            if !resp.status().is_success() {
-                return Err(Error::msg( "Can not get torrent list"));
-            }
-            response_text = resp.text().await?;
-            if response_text.contains("Unauthorized") {
+            let status = resp.status();
+            if status == StatusCode::UNAUTHORIZED {
+                retry_count += 1;
+                if retry_count > self.retry_limit {
+                    return Err(Error::msg("Can not authorize"));
+                }
                 self.login().await?;
-            } else {
-                break;
+                continue;
             }
-            retry_count += 1;
-            if retry_count > self.retry_limit { return Err(Error::msg("Can not authorize")) }
-        }
+            if !status.is_success() {
+                return Err(Error::msg(format!("Can not get torrent list (HTTP {status})")));
+            }
+            break resp.text().await?;
+        };
         let body: TorrentList = serde_json::from_str(&response_text)?;
-        Ok(body.torrents.iter().map(|(k, v)| DownloadResult {
+        Ok(body.torrents.iter().map(|(_k, v)| DownloadResult {
             name: v.name.clone(),
             size: v.size_bytes,
             creation_date: v.date_added,
@@ -95,34 +98,33 @@ impl Flood {
     pub(crate) async fn add_torrent_and_start(
         &self,
         file: &str,
-        announce: &Announce,
+        _announce: &Announce,
     ) -> Result<(), Error> {
-        let name = announce.name.clone();
-        let mut response_text = String::new();
-        let mut retry_count:u8 = 0;
+        let mut retry_count: u8 = 0;
         loop {
             let resp = self.client.post(&format!("{}/api/torrents/add-files", &self.url))
                 .json(&serde_json::json!(TorrentUploadRequest{
-                    files: vec![file.to_string().clone()],
+                    files: vec![file.to_string()],
                     destination: self.dest.clone(),
                     ..Default::default()
                 }))
                 .header("Content-Type", "application/json")
                 .send()
                 .await?;
-            if !resp.status().is_success() {
-                let status = resp.status();
+            let status = resp.status();
+            if status == StatusCode::UNAUTHORIZED {
+                retry_count += 1;
+                if retry_count > self.retry_limit {
+                    return Err(Error::msg("Can not authorize"));
+                }
+                self.login().await?;
+                continue;
+            }
+            if !status.is_success() {
                 error!("Could not add torrent, Flood returned HTTP {status}");
                 return Err(Error::msg(format!("Can not add torrent (HTTP {status})")));
             }
-            response_text = resp.text().await?;
-            if response_text.contains("Unauthorized") {
-                self.login().await?;
-            } else {
-                break;
-            }
-            retry_count += 1;
-            if retry_count > self.retry_limit { return Err(Error::msg("Can not authorize")) }
+            break;
         }
         Ok(())
     }
@@ -197,7 +199,7 @@ impl Default for TorrentUploadRequest {
             tags: Vec::new(),
             is_base_path: false,
             is_completed: false,
-            is_sequential: true,
+            is_sequential: false,
             is_initial_seeding: false,
             start: true,
         }
@@ -210,8 +212,61 @@ mod test{
     use super::*;
 
     #[tokio::test]
+    async fn expired_session_401_reauthenticates_and_retries_add() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        // Sequence: initial login -> 401 on add-files -> re-login -> 200 on add-files.
+        let server = tokio::spawn(async move {
+            let mut paths = Vec::new();
+            let responses = [
+                ("200 OK", r#"{"success":true,"username":"u","level":10}"#),
+                ("401 Unauthorized", "Unauthorized"),
+                ("200 OK", r#"{"success":true,"username":"u","level":10}"#),
+                ("200 OK", r#"{"success":true}"#),
+            ];
+            for (status, body) in responses {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 8192];
+                let n = sock.read(&mut buf).await.unwrap();
+                let req = String::from_utf8_lossy(&buf[..n]);
+                paths.push(req.lines().next().unwrap_or_default().to_string());
+
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                sock.write_all(resp.as_bytes()).await.unwrap();
+                sock.flush().await.unwrap();
+            }
+            paths
+        });
+
+        let client = Flood::new(
+            "u".into(),
+            "p".into(),
+            format!("http://127.0.0.1:{port}"),
+            "/downloads".into(),
+        )
+        .await
+        .unwrap();
+
+        let announce = Announce::new("Some.Release".into(), "1".into());
+        client.add_torrent_and_start("AAAA", &announce).await.unwrap();
+
+        let paths = server.await.unwrap();
+        assert!(paths[0].starts_with("POST /api/auth/authenticate "), "{paths:?}");
+        assert!(paths[1].starts_with("POST /api/torrents/add-files "), "{paths:?}");
+        assert!(paths[2].starts_with("POST /api/auth/authenticate "), "{paths:?}");
+        assert!(paths[3].starts_with("POST /api/torrents/add-files "), "{paths:?}");
+    }
+
+    #[ignore = "requires a reachable Flood server"]
+    #[tokio::test]
     async fn test_login() {
-        let mut client = Flood::new("".to_string(), "".to_string(), "http://10.11.12.130:3000".to_string(), "".to_string());
+        let _client = Flood::new("".to_string(), "".to_string(), "http://10.11.12.130:3000".to_string(), "".to_string()).await;
     }
     
     // Integration test: points at a Flood instance on the author's LAN. Run

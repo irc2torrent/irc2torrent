@@ -269,12 +269,12 @@ ENV HOME=/config \
     FLOOD_OPTION_HOST=:: \
     FLOOD_OPTION_PORT=3000 \
     FLOOD_OPTION_RUNDIR=/config/.local/share/flood \
-    FLOOD_OPTION_ALLOWEDPATH=/data
+    FLOOD_OPTION_ALLOWEDPATH=/downloads
 
 WORKDIR /app
 USER 1000:1000
 
-VOLUME ["/config", "/data"]
+VOLUME ["/config", "/downloads"]
 EXPOSE 3000
 EXPOSE 50000
 EXPOSE 50000/udp

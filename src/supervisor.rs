@@ -33,6 +33,9 @@ use tokio::sync::mpsc;
 /// First restart delay; doubles up to `RESTART_BACKOFF_MAX`.
 const RESTART_BACKOFF_MIN: Duration = Duration::from_secs(1);
 const RESTART_BACKOFF_MAX: Duration = Duration::from_secs(60);
+/// How long a supervised service or the bot must stay up before its restart
+/// backoff resets to `RESTART_BACKOFF_MIN`.
+const STABLE_UPTIME: Duration = Duration::from_secs(60);
 /// How long to wait for the torrent client's control channel -- rTorrent's SCGI
 /// socket, or qBittorrent's WebUI port -- before starting Flood anyway.
 const CLIENT_WAIT: Duration = Duration::from_secs(60);
@@ -86,6 +89,7 @@ struct Service {
     program: String,
     args: Vec<String>,
     child: Option<Child>,
+    started_at: Option<tokio::time::Instant>,
     backoff: Duration,
     /// When this service is due to be restarted, if it is currently down.
     ///
@@ -99,7 +103,15 @@ struct Service {
 
 impl Service {
     fn new(name: &'static str, program: String, args: Vec<String>) -> Self {
-        Self { name, program, args, child: None, backoff: RESTART_BACKOFF_MIN, restart_at: None }
+        Self {
+            name,
+            program,
+            args,
+            child: None,
+            started_at: None,
+            backoff: RESTART_BACKOFF_MIN,
+            restart_at: None,
+        }
     }
 
     fn spawn(&mut self) -> Result<u32, Error> {
@@ -138,6 +150,7 @@ impl Service {
         let pid = child.id();
         info!("Started {} (pid {pid}): {} {:?}", self.name, self.program, self.args);
         self.child = Some(child);
+        self.started_at = Some(tokio::time::Instant::now());
         Ok(pid)
     }
 
@@ -303,12 +316,17 @@ fn seed_if_absent(src: &Path, dst: &Path) {
 async fn run_bot_forever() {
     let mut backoff = RESTART_BACKOFF_MIN;
     loop {
+        let started_at = tokio::time::Instant::now();
         let attempt = std::panic::AssertUnwindSafe(async {
             let mut app = crate::Irc2Torrent::new().await;
             app.start().await;
         })
         .catch_unwind()
         .await;
+
+        if started_at.elapsed() >= STABLE_UPTIME {
+            backoff = RESTART_BACKOFF_MIN;
+        }
 
         match attempt {
             Ok(()) => {
@@ -412,13 +430,21 @@ fn prepare_directories(socket: &Path) -> Result<(), Error> {
 
     check_writable(&dirs);
 
-    // A socket left behind by an unclean shutdown stops rTorrent binding.
+    remove_stale_socket(socket);
+    Ok(())
+}
+
+/// Remove a unix socket left behind by an unclean rTorrent exit.
+///
+/// Upstream rTorrent only unlinks `m_path` during a clean `SCgi::stop()`, not
+/// before `::bind()`. Without removing it on restart as well as startup, a
+/// SIGSEGV/SIGKILL/OOM leaves rTorrent crash-looping on `EADDRINUSE` forever.
+fn remove_stale_socket(socket: &Path) {
     if socket.exists() {
         if let Err(e) = std::fs::remove_file(socket) {
             warn!("Could not remove stale socket {}: {e}", socket.display());
         }
     }
-    Ok(())
 }
 
 /// Entry point for `IRC2TORRENT_SUPERVISE`.
@@ -515,29 +541,36 @@ pub async fn run() -> Result<(), Error> {
     let mut by_pid: HashMap<i32, usize> = HashMap::new();
 
     let qbt_addr = format!("127.0.0.1:{qbt_port}");
+    let mut client_ready = false;
 
     for (idx, svc) in services.iter_mut().enumerate() {
         // The torrent client must be up before anything that talks to it:
         // Flood's first system.listMethods probe has to succeed or it settles on
         // the XML-RPC fallback, and the bot's own qBittorrent connect would
         // otherwise race the WebUI bind.
-        //
-        // Keyed on "is this service the client" rather than on `name == "flood"`
-        // as it used to be, so the wait still happens in an image that runs no
-        // Flood at all. rTorrent's control channel is a unix socket;
-        // qBittorrent's is a TCP port.
-        if svc.name != "rtorrent" && svc.name != "qbittorrent" {
+        if !client_ready && svc.name != "rtorrent" && svc.name != "qbittorrent" {
             if rtorrent_bin.exists() {
                 wait_for_socket(&rtorrent_socket).await;
             } else if qbt_bin.exists() {
                 wait_for_tcp(&qbt_addr, "qBittorrent").await;
             }
+            client_ready = true;
         }
         match svc.spawn() {
             Ok(pid) => {
                 by_pid.insert(pid as i32, idx);
             }
             Err(e) => error!("{e}"),
+        }
+    }
+
+    // If no non-client service (such as Flood) was present in `services`, wait
+    // here so the bot still does not race the torrent client's startup.
+    if !client_ready {
+        if rtorrent_bin.exists() {
+            wait_for_socket(&rtorrent_socket).await;
+        } else if qbt_bin.exists() {
+            wait_for_tcp(&qbt_addr, "qBittorrent").await;
         }
     }
 
@@ -584,6 +617,7 @@ pub async fn run() -> Result<(), Error> {
                         services[idx].restart_at = None;
                         if services[idx].name == "rtorrent" {
                             clear_stale_session_lock(&session_dir);
+                            remove_stale_socket(&rtorrent_socket);
                             rotate_rtorrent_log(&log_dir);
                         }
                         match services[idx].spawn() {
@@ -604,6 +638,9 @@ pub async fn run() -> Result<(), Error> {
                 by_pid.remove(&pid);
 
                 let svc = &mut services[idx];
+                if svc.started_at.is_some_and(|t| t.elapsed() >= STABLE_UPTIME) {
+                    svc.backoff = RESTART_BACKOFF_MIN;
+                }
                 error!("{} exited ({}); restarting in {}s.", svc.name, exit_description(status), svc.backoff.as_secs());
                 // A crash loop is invisible unless someone is reading the logs.
                 // Repeats collapse into a count in the digest, so forty restarts
@@ -611,6 +648,7 @@ pub async fn run() -> Result<(), Error> {
                 crate::notify::global()
                     .send(crate::notify::Event::ServiceRestarted(svc.name.to_string()));
                 svc.child = None;
+                svc.started_at = None;
                 svc.restart_at = Some(tokio::time::Instant::now() + svc.backoff);
                 svc.backoff = (svc.backoff * 2).min(RESTART_BACKOFF_MAX);
             }

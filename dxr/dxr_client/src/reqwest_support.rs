@@ -3,14 +3,19 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 
 use std::path::Path;
+use std::time::Duration;
 
 use http::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, USER_AGENT};
 use log::error;
 use thiserror::Error;
+#[cfg(unix)]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use tokio::net::UnixStream;
 use url::Url;
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 use dxr::{DxrError, Fault, FaultResponse, MethodCall, MethodResponse, TryFromValue, TryToParams};
 #[cfg(feature = "multicall")]
@@ -94,6 +99,8 @@ impl ClientBuilder {
 
         let client = reqwest::Client::builder()
             .default_headers(builder.headers)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT)
             .build()
             .expect("Failed to initialize reqwest client.");
 
@@ -172,6 +179,7 @@ impl Client {
         /// panicked on any response that was not XML -- an SCGI error reply, for
         /// instance. Splitting on the header/body boundary is both correct and
         /// payload-agnostic.
+        #[cfg(unix)]
         async fn send_scgi_request(socket_path: &str, body: &str) -> std::io::Result<String> {
             let headers = format!(
                 // CONTENT_LENGTH must come first per the SCGI spec.
@@ -185,12 +193,24 @@ impl Client {
             request.push(b',');
             request.extend_from_slice(body.as_bytes());
 
-            let mut stream = UnixStream::connect(Path::new(socket_path)).await?;
-            stream.write_all(&request).await?;
-            stream.flush().await?;
+            let io = async {
+                let mut stream = UnixStream::connect(Path::new(socket_path)).await?;
+                stream.write_all(&request).await?;
+                stream.flush().await?;
 
-            let mut raw = Vec::new();
-            stream.read_to_end(&mut raw).await?;
+                let mut raw = Vec::new();
+                stream.read_to_end(&mut raw).await?;
+                Ok::<Vec<u8>, std::io::Error>(raw)
+            };
+
+            let raw = tokio::time::timeout(REQUEST_TIMEOUT, io)
+                .await
+                .map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "SCGI request to rTorrent timed out",
+                    )
+                })??;
 
             let text = String::from_utf8_lossy(&raw).into_owned();
 
@@ -206,6 +226,14 @@ impl Client {
             };
 
             Ok(payload.to_string())
+        }
+
+        #[cfg(not(unix))]
+        async fn send_scgi_request(_socket_path: &str, _body: &str) -> std::io::Result<String> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "unix domain sockets are only supported on Unix platforms",
+            ))
         }
 
         // deserialize XML-RPC method response

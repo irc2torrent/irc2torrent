@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Error};
 use base64::engine::general_purpose;
@@ -17,6 +18,13 @@ use crate::platforms::TorrentPlatform;
 /// filesystems with the usual 255-byte limit.
 const MAX_STEM_LEN: usize = 200;
 
+/// Bounds on tracker downloads. `download_torrent` is awaited on the IRC read
+/// loop task, so an unbounded request stalls server PINGs and an unbounded body
+/// can OOM the container.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_TORRENT_BYTES: usize = 32 * 1024 * 1024;
+
 /// Any tracker that serves .torrent files over http(s).
 ///
 /// Nothing tracker-specific is left in here: the URL comes from the user's
@@ -27,15 +35,23 @@ pub(crate) struct HttpTracker {
     template: UrlTemplate,
     rss_key: String,
     torrent_dir: PathBuf,
+    client: reqwest::Client,
 }
 
 impl HttpTracker {
     pub fn new(label: &str, options: &PlatformOptions) -> Result<Self, Error> {
+        let client = reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT)
+            .user_agent(concat!("irc2torrent/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .context("Building tracker HTTP client")?;
         Ok(Self {
             label: label.to_string(),
             template: UrlTemplate::parse(&options.download_url_template)?,
             rss_key: options.rss_key.clone(),
             torrent_dir: PathBuf::from(&options.torrent_dir),
+            client,
         })
     }
 }
@@ -140,7 +156,10 @@ impl TorrentPlatform for HttpTracker {
             key: &self.rss_key,
         })?;
 
-        let resp = reqwest::get(url)
+        let mut resp = self
+            .client
+            .get(url)
+            .send()
             .await
             .map_err(|e| Error::msg(format!("Torrent request failed: {}", e.without_url())))?;
 
@@ -151,10 +170,27 @@ impl TorrentPlatform for HttpTracker {
             )));
         }
 
-        let bytes = resp
-            .bytes()
+        if let Some(len) = resp.content_length() {
+            if len > MAX_TORRENT_BYTES as u64 {
+                return Err(Error::msg(format!(
+                    "Torrent file is too large ({len} bytes, max {MAX_TORRENT_BYTES})"
+                )));
+            }
+        }
+
+        let mut bytes = Vec::new();
+        while let Some(chunk) = resp
+            .chunk()
             .await
-            .map_err(|e| Error::msg(format!("Reading torrent body failed: {}", e.without_url())))?;
+            .map_err(|e| Error::msg(format!("Reading torrent body failed: {}", e.without_url())))?
+        {
+            if bytes.len().saturating_add(chunk.len()) > MAX_TORRENT_BYTES {
+                return Err(Error::msg(format!(
+                    "Torrent file exceeded maximum size of {MAX_TORRENT_BYTES} bytes"
+                )));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
 
         let dir = self.get_torrent_files_dir();
         if !dir.exists() {
@@ -170,14 +206,14 @@ impl TorrentPlatform for HttpTracker {
         let mut out = fs::File::create(&out_path)
             .await
             .with_context(|| format!("Creating {}", out_path.display()))?;
-        out.write_all(bytes.as_ref())
+        out.write_all(&bytes)
             .await
             .with_context(|| format!("Writing {}", out_path.display()))?;
         out.flush()
             .await
             .with_context(|| format!("Flushing {}", out_path.display()))?;
 
-        Ok(general_purpose::STANDARD.encode(bytes.as_ref()))
+        Ok(general_purpose::STANDARD.encode(&bytes))
     }
 }
 

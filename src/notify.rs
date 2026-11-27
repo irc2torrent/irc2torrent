@@ -179,11 +179,20 @@ pub struct Notifier {
 /// `Option` through init, `start` publishes here and the supervisor reads it.
 /// Anything that happens before the bot is up simply finds the null handle,
 /// which is the honest answer -- there was nowhere to send it yet.
-static GLOBAL: std::sync::OnceLock<Notifier> = std::sync::OnceLock::new();
+///
+/// `RwLock<Option<Notifier>>` rather than `OnceLock`: if the supervisor
+/// restarts the bot after a panic, `start` replaces the stored handle so the
+/// previous dispatcher's channel closes (letting the old task exit) and future
+/// supervisor events reach the new dispatcher.
+static GLOBAL: std::sync::RwLock<Option<Notifier>> = std::sync::RwLock::new(None);
 
 /// The process-wide notifier, or a null handle if none is configured yet.
 pub fn global() -> Notifier {
-    GLOBAL.get().cloned().unwrap_or_else(Notifier::disabled)
+    GLOBAL
+        .read()
+        .ok()
+        .and_then(|g| g.clone())
+        .unwrap_or_else(Notifier::disabled)
 }
 
 impl Notifier {
@@ -222,10 +231,16 @@ impl Notifier {
 trait Backend: Send + Sync {
     fn name(&self) -> &'static str;
     async fn deliver(&self, subject: &str, body: &str) -> Result<(), Error>;
-    /// Re-attempt anything the backend is holding. Called on each digest tick.
+    /// Re-attempt anything the backend is holding. Called on each retry tick.
     /// Only IRC needs it -- a message to an absent nick is discarded by the
     /// server, so it is held until the owner reappears.
     async fn retry_pending(&self) {}
+    /// Whether this backend owns its own hold/retry queue. When true, the
+    /// dispatcher must NOT also push failed deliveries into `target.outbox`,
+    /// or every retry re-enters `deliver()` and duplicates the held message.
+    fn manages_own_retry(&self) -> bool {
+        false
+    }
 }
 
 /// A message a backend could not take yet.
@@ -522,7 +537,11 @@ impl NtfyBackend {
             format!("https://ntfy.sh/{topic}")
         };
 
-        info!("ntfy notifications enabled to {url}.");
+        let host = reqwest::Url::parse(&url)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_string))
+            .unwrap_or_else(|| "ntfy".to_string());
+        info!("ntfy notifications enabled (host: {host}).");
         Some(Self {
             client: reqwest::Client::builder().timeout(SEND_TIMEOUT).build().ok()?,
             url,
@@ -665,6 +684,10 @@ impl Backend for IrcBackend {
         if let (Some(sender), true) = (sender, online) {
             self.flush_held(&sender);
         }
+    }
+
+    fn manages_own_retry(&self) -> bool {
+        true
     }
 }
 
@@ -1121,7 +1144,7 @@ impl Dispatcher {
 
     async fn send_summary(&mut self) {
         let totals = std::mem::take(&mut self.totals);
-        let body = ["added", "finished", "failed", "restarts"]
+        let body = ["added", "finished", "failed", "rejected", "restarts"]
             .iter()
             .map(|k| format!("{k}: {}", totals.get(k).copied().unwrap_or(0)))
             .collect::<Vec<_>>()
@@ -1170,6 +1193,10 @@ impl Dispatcher {
         let target = &self.targets[index];
         if let Err(e) = target.backend.deliver(subject, &body).await {
             let name = target.backend.name();
+            if target.backend.manages_own_retry() {
+                info!("Deferred {name} notification: {e}");
+                return;
+            }
             error!("Could not send {name} notification: {e}; will retry.");
 
             let outbox = &mut self.targets[index].outbox;
@@ -1360,8 +1387,9 @@ pub fn start(
     tokio::spawn(dispatcher.run());
 
     let notifier = Notifier { tx: Some(tx) };
-    // Ignore a second call: only the first set wins, and start() runs once.
-    let _ = GLOBAL.set(notifier.clone());
+    if let Ok(mut slot) = GLOBAL.write() {
+        *slot = Some(notifier.clone());
+    }
     notifier
 }
 
@@ -1442,13 +1470,21 @@ pub async fn poll(
             tick.tick().await;
         }
 
+        // Consult per-backend overrides as well as globals: a target that turns
+        // `on_download_finished = true` or `on_disk_low = true` in its own
+        // `[..events]` table must still be polled even when the global switch
+        // is false.
+        let (want_finished, want_disk_low) = source
+            .poll_wants()
+            .unwrap_or((options.on_download_finished, options.on_disk_low));
+
         // Nothing worth polling for: skip the work, but keep ticking so turning
         // it on later is picked up. This is a timer wake-up, not an RPC call.
-        if !(options.on_download_finished || options.on_disk_low) {
+        if !(want_finished || want_disk_low) {
             continue;
         }
 
-        if options.on_download_finished {
+        if want_finished {
             if let Some(rows) = tp.get_completed().await {
                 let current: HashSet<String> = rows.iter().map(|(h, _)| h.clone()).collect();
 
@@ -1471,7 +1507,7 @@ pub async fn poll(
             }
         }
 
-        if options.on_disk_low {
+        if want_disk_low {
             let path = std::path::Path::new(&options.disk_path);
             match free_space(path) {
                 Some((percent, gib)) if (percent as f64) < options.disk_warn_percent => {
@@ -1979,6 +2015,81 @@ mod test {
 
         assert!(backend.deliver("disk is low", "body").await.is_err());
         assert!(backend.pending.lock().unwrap().is_empty());
+    }
+
+    /// Regression: `IrcBackend` holds messages in its own `pending` queue while
+    /// the owner is offline. Previously `Dispatcher::deliver_to` also pushed
+    /// the returned `Err` into `target.outbox`, so every retry re-entered
+    /// `IrcBackend::deliver()` and queued up to 6 duplicate copies.
+    #[tokio::test(start_paused = true)]
+    async fn offline_irc_notifications_are_delivered_once_not_duplicated() {
+        let link = IrcSenderSlot::default();
+        let cfg = Config::default_for_test();
+        let options = NotificationOptions {
+            irc: Some(IrcNotifyOptions::default()),
+            ..NotificationOptions::default()
+        };
+        let irc_owner = Some((link.clone(), "owner".to_string()));
+        let targets = build_section_targets(&options, &irc_owner, &["irc"]);
+        let (_tx, rx) = mpsc::channel(4);
+        let mut d = Dispatcher {
+            rx,
+            targets,
+            options,
+            source: cfg.shared_notifications(),
+            irc_owner,
+            buffer: Vec::new(),
+            totals: HashMap::new(),
+        };
+
+        // Deliver while offline, then run several retry cycles.
+        d.deliver_to(0, "irc2torrent: Finished: Alpha", "Finished: Alpha").await;
+        assert!(
+            d.targets[0].outbox.is_empty(),
+            "IRC manages its own hold queue and must not double-queue into outbox"
+        );
+        for _ in 0..4 {
+            for t in &d.targets {
+                t.backend.retry_pending().await;
+            }
+            d.retry_outboxes().await;
+        }
+
+        // Owner comes back online.
+        let (outbound, mut rx_out) = crate::irc_processor::irc::Outbound::for_test();
+        *link.lock().unwrap() = IrcLink::connected(outbound);
+
+        for t in &d.targets {
+            t.backend.retry_pending().await;
+        }
+        d.retry_outboxes().await;
+
+        let sent: Vec<String> = std::iter::from_fn(|| rx_out.try_recv().ok())
+            .map(|m| m.text().to_string())
+            .collect();
+        assert_eq!(sent, vec!["irc2torrent: Finished: Alpha"]);
+    }
+
+    /// Per-backend overrides must trigger polling even when the global switches
+    /// are false.
+    #[test]
+    fn poll_wants_honours_per_backend_overrides() {
+        let mut cfg = Config::default_for_test();
+        cfg.set_notifications_for_test(NotificationOptions {
+            on_download_finished: false,
+            on_disk_low: false,
+            ntfy: Some(NtfyOptions {
+                topic: "secret-topic".into(),
+                token: None,
+                events: EventFilter {
+                    on_download_finished: Some(true),
+                    on_disk_low: Some(true),
+                    ..EventFilter::default()
+                },
+            }),
+            ..NotificationOptions::default()
+        });
+        assert_eq!(cfg.shared_notifications().poll_wants(), Some((true, true)));
     }
 
     // -----------------------------------------------------------------------

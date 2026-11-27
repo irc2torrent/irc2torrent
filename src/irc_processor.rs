@@ -1,5 +1,4 @@
 pub mod irc {
-    use std::any::Any;
     use std::cell::RefCell;
     use std::collections::HashMap;
     use std::rc::Rc;
@@ -267,7 +266,7 @@ pub mod irc {
             }
             if self.tx.send(msg).is_err() {
                 if cancellable {
-                    self.pending.fetch_sub(1, Ordering::Relaxed);
+                    decrement_pending(&self.pending);
                 }
                 error!("Outbound queue is gone; dropping message to {target}.");
             }
@@ -302,6 +301,21 @@ pub mod irc {
             self.epoch.load(std::sync::atomic::Ordering::Relaxed)
         }
 
+        #[cfg(test)]
+        pub(crate) fn pop_as_pacer(&self, rx: &mut tokio::sync::mpsc::UnboundedReceiver<Outgoing>) -> usize {
+            let mut sent = 0;
+            while let Ok(msg) = rx.try_recv() {
+                if Self::discards(&msg, self.epoch.load(std::sync::atomic::Ordering::Relaxed)) {
+                    continue;
+                }
+                if msg.cancellable {
+                    decrement_pending(&self.pending);
+                }
+                sent += 1;
+            }
+            sent
+        }
+
         /// Discard every cancellable message queued, returning roughly how many.
         ///
         /// One epoch for the whole queue, so a `stop!` clears *all* outstanding
@@ -316,6 +330,23 @@ pub mod irc {
 
             self.epoch.fetch_add(1, Ordering::Relaxed);
             self.pending.swap(0, Ordering::Relaxed)
+        }
+    }
+
+    /// Saturating decrement for `Outbound::pending`.
+    ///
+    /// `cancel()` zeroes `pending` while cancelled messages are still sitting in
+    /// the channel. Using saturating subtraction (and skipping the decrement for
+    /// already-discarded messages) ensures `pending` can never wrap around to
+    /// `usize::MAX`.
+    fn decrement_pending(pending: &std::sync::atomic::AtomicUsize) {
+        use std::sync::atomic::Ordering;
+        let mut cur = pending.load(Ordering::Relaxed);
+        while cur > 0 {
+            match pending.compare_exchange_weak(cur, cur - 1, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(next) => cur = next,
+            }
         }
     }
 
@@ -347,15 +378,18 @@ pub mod irc {
                 std::collections::VecDeque::new();
 
             while let Some(msg) = rx.recv().await {
-                if msg.cancellable {
-                    pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                }
-
                 // Cancelled before it ever got a turn. Dropped without waiting
                 // and without consuming a rate slot, so a `stop!` clears a long
                 // backlog in milliseconds rather than draining it slowly.
+                // Checked *before* touching `pending`: `cancel()` already zeroed
+                // the counter for everything from older epochs, so decrementing
+                // here would wrap `pending` below zero.
                 if Outbound::discards(&msg, epoch.load(std::sync::atomic::Ordering::Relaxed)) {
                     continue;
+                }
+
+                if msg.cancellable {
+                    decrement_pending(&pending);
                 }
 
                 // Read the limit per message rather than capturing it, so an
@@ -517,7 +551,7 @@ pub mod irc {
                                     break;
                                 }
                                 Err(e) => {
-                                    if e.type_id() == Error::PingTimeout.type_id() {
+                                    if matches!(e, Error::PingTimeout) {
                                         warn!("Ping timeout.");
                                     } else {
                                         error!("IRC stream error: {:?}", e);
@@ -722,6 +756,13 @@ pub mod irc {
         }
 
         async fn msg_process(&mut self, msg: &Message) {
+            // Keep our tracked nick in sync with the irc crate. `connect_irc`
+            // runs before the server answers `NICK`, so if the primary nick was
+            // taken (433) and the crate fell back to an alt_nick -- or if the
+            // server later changes our nick -- `current_nickname()` updates
+            // while a cached copy stays stale and breaks private-message matching.
+            self.sync_our_nick();
+
             // `target` is where the message was addressed: a channel, or our own
             // nick for a private message. It is NOT the sender -- conflating the
             // two previously made private-message auth and the NickServ branch
@@ -1040,16 +1081,33 @@ pub mod irc {
             let origin = MessageOrigin::new(sender, target, &self.our_nick);
             if let SourceValidated = self.auth.authenticate(&origin, "", Announcement) {
                 let outcome = self.tp.process_torrent(announce).await;
-                // reply_to, not target: for a private message the target is our
-                // own nick, so replying there made the bot message itself and
-                // then process its own reply.
-                self.send_privmsg(self.reply_to(target, sender), &outcome.to_string());
+                // Only reply to private-message announcements from the owner.
+                // Replying to a channel announcement would spam the tracker's
+                // public announce channel (and burn our outbound flood budget)
+                // on every single release.
+                if target.eq_ignore_ascii_case(&self.our_nick) {
+                    self.send_privmsg(sender, &outcome.to_string());
+                }
             } else {
                 info!(
                     "Ignoring announcement from {sender} on {target}: announcements are accepted \
                      on a configured channel, or by private message from the owner when \
                      commands_enabled is set."
                 );
+            }
+        }
+
+        fn sync_our_nick(&mut self) {
+            let live = self
+                .client
+                .borrow()
+                .as_ref()
+                .map(|c| c.current_nickname().to_string());
+            if let Some(live) = live {
+                if live != self.our_nick {
+                    info!("Active IRC nickname changed: {} -> {}.", self.our_nick, live);
+                    self.our_nick = live;
+                }
             }
         }
 
@@ -1399,6 +1457,26 @@ pub mod test {
         queue.send("owner", "one");
         assert_eq!(queue.cancel(), 1);
         assert_eq!(queue.cancel(), 0, "the same messages must not be counted twice");
+    }
+
+    /// Regression: draining cancelled messages in the pacer used to decrement
+    /// `pending` *after* `cancel()` had zeroed it, wrapping the counter to
+    /// `usize::MAX`.
+    #[test]
+    fn draining_cancelled_messages_never_underflows_pending_count() {
+        use crate::irc_processor::irc::Outbound;
+
+        let (queue, mut rx) = Outbound::for_test();
+        queue.send("owner", "a");
+        queue.send("owner", "b");
+        queue.send("owner", "c");
+
+        assert_eq!(queue.cancel(), 3);
+        assert_eq!(queue.pop_as_pacer(&mut rx), 0, "all three were cancelled");
+        assert_eq!(queue.cancel(), 0, "pending must stay 0, never wrap to usize::MAX");
+
+        queue.send("owner", "fresh");
+        assert_eq!(queue.cancel(), 1);
     }
 
     /// The numerics the identity check depends on must actually parse into the
